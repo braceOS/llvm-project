@@ -75,6 +75,31 @@ TEST(TripleTest, BasicParsing) {
   EXPECT_EQ("d", T.getEnvironmentName().str());
 }
 
+TEST(TripleTest, Brace64) {
+  Triple T("brace64-unknown-none-elf");
+
+  EXPECT_EQ(Triple::brace64, T.getArch());
+  EXPECT_EQ("brace64", T.getArchName());
+  EXPECT_EQ("brace64", Triple::getArchTypeName(Triple::brace64));
+  EXPECT_EQ("brace", Triple::getArchTypePrefix(Triple::brace64));
+  EXPECT_EQ(Triple::brace64, Triple::getArchTypeForLLVMName("brace64"));
+  EXPECT_EQ(Triple::UnknownArch, Triple::getArchTypeForLLVMName("brace"));
+  EXPECT_EQ(Triple::UnknownArch, Triple("brace-unknown-none-elf").getArch());
+
+  EXPECT_EQ(64U, T.getArchPointerBitWidth());
+  EXPECT_TRUE(T.isArch64Bit());
+  EXPECT_TRUE(T.isLittleEndian());
+  EXPECT_EQ(Triple::ELF, T.getObjectFormat());
+  EXPECT_EQ("e-m:e-p:64:64-i64:64-i128:128-n32:64-S128", T.computeDataLayout());
+  EXPECT_EQ("brace64-unknown-none-elf",
+            Triple::normalize("brace64-unknown-none-elf"));
+
+  EXPECT_EQ(Triple::UnknownArch, T.get32BitArchVariant().getArch());
+  EXPECT_EQ(Triple::brace64, T.get64BitArchVariant().getArch());
+  EXPECT_EQ(Triple::UnknownArch, T.getBigEndianArchVariant().getArch());
+  EXPECT_EQ(Triple::brace64, T.getLittleEndianArchVariant().getArch());
+}
+
 TEST(TripleTest, ParsedIDs) {
   Triple T;
 

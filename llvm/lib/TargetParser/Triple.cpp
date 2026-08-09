@@ -37,6 +37,7 @@ StringRef Triple::getArchTypeName(ArchType Kind) {
   case avr:            return "avr";
   case bpfeb:          return "bpfeb";
   case bpfel:          return "bpfel";
+  case brace64:        return "brace64";
   case csky:           return "csky";
   case dxil:           return "dxil";
   case hexagon:        return "hexagon";
@@ -209,6 +210,8 @@ StringRef Triple::getArchTypePrefix(ArchType Kind) {
 
   case bpfel:
   case bpfeb:       return "bpf";
+
+  case brace64:     return "brace";
 
   case sparcv9:
   case sparcel:
@@ -462,6 +465,7 @@ Triple::ArchType Triple::getArchTypeForLLVMName(StringRef Name) {
       .Case("armeb", armeb)
       .Case("avr", avr)
       .StartsWith("bpf", BPFArch)
+      .Case("brace64", brace64)
       .Case("m68k", m68k)
       .Case("mips", mips)
       .Case("mipsel", mipsel)
@@ -613,6 +617,7 @@ static Triple::ArchType parseArch(StringRef ArchName) {
           .Case("thumb", Triple::thumb)
           .Case("thumbeb", Triple::thumbeb)
           .Case("avr", Triple::avr)
+          .Case("brace64", Triple::brace64)
           .Case("m68k", Triple::m68k)
           .Case("msp430", Triple::msp430)
           .Cases({"mips", "mipseb", "mipsallegrex", "mipsisa32r6", "mipsr6"},
@@ -992,6 +997,7 @@ static Triple::ObjectFormatType getDefaultFormat(const Triple &T) {
   case Triple::avr:
   case Triple::bpfeb:
   case Triple::bpfel:
+  case Triple::brace64:
   case Triple::csky:
   case Triple::hexagon:
   case Triple::hsail64:
@@ -1762,6 +1768,7 @@ unsigned Triple::getArchPointerBitWidth(llvm::Triple::ArchType Arch) {
   case llvm::Triple::amdil64:
   case llvm::Triple::bpfeb:
   case llvm::Triple::bpfel:
+  case llvm::Triple::brace64:
   case llvm::Triple::hsail64:
   case llvm::Triple::loongarch64:
   case llvm::Triple::mips64:
@@ -1823,6 +1830,7 @@ Triple Triple::get32BitArchVariant() const {
   case Triple::avr:
   case Triple::bpfeb:
   case Triple::bpfel:
+  case Triple::brace64:
   case Triple::msp430:
   case Triple::systemz:
   case Triple::ve:
@@ -1927,6 +1935,7 @@ Triple Triple::get64BitArchVariant() const {
   case Triple::amdil64:
   case Triple::bpfeb:
   case Triple::bpfel:
+  case Triple::brace64:
   case Triple::hsail64:
   case Triple::loongarch64:
   case Triple::mips64:
@@ -1992,6 +2001,7 @@ Triple Triple::getBigEndianArchVariant() const {
   case Triple::amdil64:
   case Triple::amdil:
   case Triple::avr:
+  case Triple::brace64:
   case Triple::dxil:
   case Triple::hexagon:
   case Triple::hsail64:
@@ -2104,6 +2114,7 @@ bool Triple::isLittleEndian() const {
   case Triple::arm:
   case Triple::avr:
   case Triple::bpfel:
+  case Triple::brace64:
   case Triple::csky:
   case Triple::dxil:
   case Triple::hexagon:
