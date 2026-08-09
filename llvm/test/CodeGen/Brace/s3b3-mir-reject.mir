@@ -1,0 +1,289 @@
+# REQUIRES: brace-registered-target
+#
+# Generate canonical restart seams from the registered fixtures, mutate one
+# post-isel or post-RA invariant at a time, and require fail-closed publication.
+# Parser-level malformed names/targets use plain `not`; validator failures use
+# `not --crash` because this experimental backend reports contract violations
+# with report_fatal_error.
+#
+# DEFINE: %{brace-s3-llc} = llc -mtriple=brace64-unknown-none-elf \
+# DEFINE:   -target-abi=brace-system-s2-leaf-r0 -O1 \
+# DEFINE:   -verify-machineinstrs -filetype=obj
+# RUN: rm -rf %t.dir && mkdir -p %t.dir
+# RUN: %{brace-s3-llc} -stop-after=finalize-isel \
+# RUN:   %S/s3b3-direct-store.ll -o %t.dir/isel.mir
+# RUN: %{brace-s3-llc} -stop-after=virtregrewriter \
+# RUN:   %S/s3b3-direct-store.ll -o %t.dir/direct.mir
+# RUN: %{brace-s3-llc} -stop-after=virtregrewriter \
+# RUN:   %S/s3b3-load-and-diamond.ll -o %t.dir/diamond.mir
+# RUN: %{brace-s3-llc} -stop-after=virtregrewriter \
+# RUN:   %S/s3b3-poll-echo.ll -o %t.dir/poll.mir
+#
+# A resumed MIR file is still an untrusted module.  The CLI selector cannot
+# authorize an embedded module whose ABI flag disagrees with it.
+# RUN: sed 's/brace-system-s2-leaf-r0/not-brace/' \
+# RUN:   %t.dir/direct.mir > %t.dir/abi-mismatch.mir
+# RUN: not --crash %{brace-s3-llc} -start-after=virtregrewriter \
+# RUN:   %t.dir/abi-mismatch.mir -o %t.dir/abi-mismatch.o
+# RUN: test ! -s %t.dir/abi-mismatch.o
+#
+# Wrong typed bank.
+# RUN: sed 's/$r4 = CONST32 21845/$r2 = CONST32 21845/' \
+# RUN:   %t.dir/direct.mir > %t.dir/wrong-bank.mir
+# RUN: not --crash %{brace-s3-llc} -start-after=virtregrewriter \
+# RUN:   %t.dir/wrong-bank.mir -o %t.dir/wrong-bank.o
+# RUN: test ! -s %t.dir/wrong-bank.o
+#
+# Undeclared physical register name must fail in the MIR parser.
+# RUN: sed 's/$r4 = CONST32 21845/$r6 = CONST32 21845/' \
+# RUN:   %t.dir/direct.mir > %t.dir/undeclared-reg.mir
+# RUN: not %{brace-s3-llc} -start-after=virtregrewriter \
+# RUN:   %t.dir/undeclared-reg.mir -o %t.dir/undeclared-reg.o
+# RUN: test ! -s %t.dir/undeclared-reg.o
+#
+# MachineFunction live-in state is outside the zero-input ABI.
+# RUN: awk '/^liveins:         \[\]$/ { print "liveins:"; \
+# RUN:   print "  - { reg: \047$r0\047, virtual-reg: \047\047 }"; \
+# RUN:   next } { print }' %t.dir/direct.mir > %t.dir/livein.mir
+# RUN: not --crash %{brace-s3-llc} -start-after=virtregrewriter \
+# RUN:   %t.dir/livein.mir -o %t.dir/livein.o
+# RUN: test ! -s %t.dir/livein.o
+#
+# Skipping physical-register rewrite on the post-isel seam must expose and
+# reject the surviving virtual registers.
+# RUN: not --crash %{brace-s3-llc} -start-after=virtregrewriter \
+# RUN:   %t.dir/isel.mir -o %t.dir/vreg.o
+# RUN: test ! -s %t.dir/vreg.o
+#
+# Frame and stack-object state are independently rejected.
+# RUN: sed 's/adjustsStack:    false/adjustsStack:    true/' \
+# RUN:   %t.dir/direct.mir > %t.dir/frame-v2.mir
+# RUN: not --crash %{brace-s3-llc} -start-after=virtregrewriter \
+# RUN:   %t.dir/frame-v2.mir -o %t.dir/frame-v2.o
+# RUN: test ! -s %t.dir/frame-v2.o
+# RUN: awk '/^stack:           \[\]$/ { print "stack:"; \
+# RUN:   print "  - { id: 0, offset: -4, size: 4, alignment: 4 }"; \
+# RUN:   next } { print }' %t.dir/direct.mir > %t.dir/stack-object.mir
+# RUN: not --crash %{brace-s3-llc} -start-after=virtregrewriter \
+# RUN:   %t.dir/stack-object.mir -o %t.dir/stack-object.o
+# RUN: test ! -s %t.dir/stack-object.o
+# RUN: sed 's/STORE32 killed $r0/STORE32 %%stack.0/' \
+# RUN:   %t.dir/stack-object.mir > %t.dir/frame-index.mir
+# RUN: not --crash %{brace-s3-llc} -start-after=virtregrewriter \
+# RUN:   %t.dir/frame-index.mir -o %t.dir/frame-index.o
+# RUN: test ! -s %t.dir/frame-index.o
+#
+# Call/return-address state is forbidden even without a call instruction.
+# RUN: sed 's/hasCalls:        false/hasCalls:        true/' \
+# RUN:   %t.dir/direct.mir > %t.dir/call-state.mir
+# RUN: not --crash %{brace-s3-llc} -start-after=virtregrewriter \
+# RUN:   %t.dir/call-state.mir -o %t.dir/call-state.o
+# RUN: test ! -s %t.dir/call-state.o
+# RUN: sed 's/^    RET$/    PATCHPOINT 0, 0, 0, 0, 0\n    RET/' \
+# RUN:   %t.dir/direct.mir > %t.dir/call-opcode.mir
+# RUN: not --crash %{brace-s3-llc} -start-after=virtregrewriter \
+# RUN:   %t.dir/call-opcode.mir -o %t.dir/call-opcode.o
+# RUN: test ! -s %t.dir/call-opcode.o
+# RUN: sed 's/isReturnAddressTaken: false/isReturnAddressTaken: true/' \
+# RUN:   %t.dir/direct.mir > %t.dir/return-address.mir
+# RUN: not --crash %{brace-s3-llc} -start-after=virtregrewriter \
+# RUN:   %t.dir/return-address.mir -o %t.dir/return-address.o
+# RUN: test ! -s %t.dir/return-address.o
+# RUN: sed 's/callsEHReturn:   false/callsEHReturn:   true/' \
+# RUN:   %t.dir/direct.mir > %t.dir/eh-return-state.mir
+# RUN: not --crash %{brace-s3-llc} -start-after=virtregrewriter \
+# RUN:   %t.dir/eh-return-state.mir -o %t.dir/eh-return-state.o
+# RUN: test ! -s %t.dir/eh-return-state.o
+# RUN: sed 's/maxCallFrameSize: 4294967295/maxCallFrameSize: 8/' \
+# RUN:   %t.dir/direct.mir > %t.dir/max-call-frame.mir
+# RUN: not --crash %{brace-s3-llc} -start-after=virtregrewriter \
+# RUN:   %t.dir/max-call-frame.mir -o %t.dir/max-call-frame.o
+# RUN: test ! -s %t.dir/max-call-frame.o
+#
+# Disabling liveness must not turn an undefined integer-bank use into an
+# initialized S2 slot read at the MIR restart seam.
+# RUN: sed -e 's/tracksRegLiveness: true/tracksRegLiveness: false/' \
+# RUN:   -e '/    $r4 = CONST32 21845/d' \
+# RUN:   %t.dir/direct.mir > %t.dir/untracked-undefined-use.mir
+# RUN: not --crash %{brace-s3-llc} -start-after=virtregrewriter \
+# RUN:   %t.dir/untracked-undefined-use.mir -o %t.dir/untracked-undefined-use.o
+# RUN: test ! -s %t.dir/untracked-undefined-use.o
+# RUN: sed -e 's/failsVerification: false/failsVerification: true/' \
+# RUN:   -e '/    $r4 = CONST32 21845/d' \
+# RUN:   %t.dir/direct.mir > %t.dir/skipped-verifier-use.mir
+# RUN: not --crash %{brace-s3-llc} -start-after=virtregrewriter \
+# RUN:   %t.dir/skipped-verifier-use.mir -o %t.dir/skipped-verifier-use.o
+# RUN: test ! -s %t.dir/skipped-verifier-use.o
+# RUN: sed 's/^    $r4 = CONST32/    $r4 = frame-setup CONST32/' \
+# RUN:   %t.dir/direct.mir > %t.dir/instruction-flags.mir
+# RUN: not --crash %{brace-s3-llc} -start-after=virtregrewriter \
+# RUN:   %t.dir/instruction-flags.mir -o %t.dir/instruction-flags.o
+# RUN: test ! -s %t.dir/instruction-flags.o
+#
+# Target-independent COPY is parser-valid but outside the publication opcode
+# set.  RET with an explicit operand is malformed at parser/verifier intake.
+# RUN: sed 's/^    RET$/    COPY $r4, $r5/' \
+# RUN:   %t.dir/direct.mir > %t.dir/unsupported-opcode.mir
+# RUN: not --crash %{brace-s3-llc} -start-after=virtregrewriter \
+# RUN:   %t.dir/unsupported-opcode.mir -o %t.dir/unsupported-opcode.o
+# RUN: test ! -s %t.dir/unsupported-opcode.o
+# RUN: sed 's/^    RET$/    RET 0/' %t.dir/direct.mir > %t.dir/malformed-ret.mir
+# RUN: not --crash %{brace-s3-llc} -start-after=virtregrewriter \
+# RUN:   %t.dir/malformed-ret.mir -o %t.dir/malformed-ret.o
+# RUN: test ! -s %t.dir/malformed-ret.o
+#
+# Immediate sign-extension and conditional-sense spelling are canonical.
+# RUN: sed 's/CONST32 21845/CONST32 4294967296/' \
+# RUN:   %t.dir/direct.mir > %t.dir/constant-range.mir
+# RUN: not --crash %{brace-s3-llc} -start-after=virtregrewriter \
+# RUN:   %t.dir/constant-range.mir -o %t.dir/constant-range.o
+# RUN: test ! -s %t.dir/constant-range.o
+# RUN: sed 's/BRCOND32 killed $r4, %bb.2, 1/BRCOND32 killed $r4, %bb.2, 2/' \
+# RUN:   %t.dir/diamond.mir > %t.dir/branch-sense.mir
+# RUN: not --crash %{brace-s3-llc} -start-after=virtregrewriter \
+# RUN:   %t.dir/branch-sense.mir -o %t.dir/branch-sense.o
+# RUN: test ! -s %t.dir/branch-sense.o
+# RUN: sed 's/BRCOND32 killed $r4, %bb.2, 1/BRCOND32 killed $r4, %bb.2, 1, implicit-def $r5/' \
+# RUN:   %t.dir/diamond.mir > %t.dir/branch-implicit.mir
+# RUN: not --crash %{brace-s3-llc} -start-after=virtregrewriter \
+# RUN:   %t.dir/branch-implicit.mir -o %t.dir/branch-implicit.o
+# RUN: test ! -s %t.dir/branch-implicit.o
+#
+# A branch target with no emitting operation and an out-of-range MBB name are
+# separate validator/parser boundaries.
+# RUN: sed 's/^    RET$/    /' %t.dir/diamond.mir > %t.dir/empty-target.mir
+# RUN: not --crash %{brace-s3-llc} -start-after=virtregrewriter \
+# RUN:   %t.dir/empty-target.mir -o %t.dir/empty-target.o
+# RUN: test ! -s %t.dir/empty-target.o
+# RUN: sed 's/%bb.3/%bb.9/g' %t.dir/diamond.mir > %t.dir/bad-target.mir
+# RUN: not %{brace-s3-llc} -start-after=virtregrewriter \
+# RUN:   %t.dir/bad-target.mir -o %t.dir/bad-target.o
+# RUN: test ! -s %t.dir/bad-target.o
+#
+# The post-RA trust boundary must revalidate the complete memory effect, not
+# merely trust the MachineInstr opcode selected earlier.
+# RUN: sed 's/(volatile store/(store/' \
+# RUN:   %t.dir/direct.mir > %t.dir/nonvolatile-mmo.mir
+# RUN: not --crash %{brace-s3-llc} -start-after=virtregrewriter \
+# RUN:   %t.dir/nonvolatile-mmo.mir -o %t.dir/nonvolatile-mmo.o
+# RUN: test ! -s %t.dir/nonvolatile-mmo.o
+# RUN: sed 's/(volatile store/(volatile non-temporal store/' \
+# RUN:   %t.dir/direct.mir > %t.dir/nontemporal-mmo.mir
+# RUN: not --crash %{brace-s3-llc} -start-after=virtregrewriter \
+# RUN:   %t.dir/nontemporal-mmo.mir -o %t.dir/nontemporal-mmo.o
+# RUN: test ! -s %t.dir/nontemporal-mmo.o
+# RUN: sed 's/, addrspace 200)/, addrspace 0)/' \
+# RUN:   %t.dir/direct.mir > %t.dir/wrong-as-mmo.mir
+# RUN: not --crash %{brace-s3-llc} -start-after=virtregrewriter \
+# RUN:   %t.dir/wrong-as-mmo.mir -o %t.dir/wrong-as-mmo.o
+# RUN: test ! -s %t.dir/wrong-as-mmo.o
+# RUN: sed 's/align 1048576, addrspace 200/align 2, addrspace 200/' \
+# RUN:   %t.dir/direct.mir > %t.dir/misaligned-mmo.mir
+# RUN: not --crash %{brace-s3-llc} -start-after=virtregrewriter \
+# RUN:   %t.dir/misaligned-mmo.mir -o %t.dir/misaligned-mmo.o
+# RUN: test ! -s %t.dir/misaligned-mmo.o
+# RUN: sed 's/PADDR_IMM 1048576/PADDR_IMM 1/' \
+# RUN:   %t.dir/direct.mir > %t.dir/address-mismatch.mir
+# RUN: not --crash %{brace-s3-llc} -start-after=virtregrewriter \
+# RUN:   %t.dir/address-mismatch.mir -o %t.dir/address-mismatch.o
+# RUN: test ! -s %t.dir/address-mismatch.o
+# RUN: sed 's/STORE32 killed $r0, killed $r4/STORE32 killed $r0, undef $r4/' \
+# RUN:   %t.dir/direct.mir > %t.dir/undef-register.mir
+# RUN: not --crash %{brace-s3-llc} -start-after=virtregrewriter \
+# RUN:   %t.dir/undef-register.mir -o %t.dir/undef-register.o
+# RUN: test ! -s %t.dir/undef-register.o
+#
+# Implicit register effects cannot hide a live-out from explicit operand
+# counting or from AsmPrinter.
+# RUN: sed 's/^    RET$/    RET implicit $r4/' \
+# RUN:   %t.dir/direct.mir > %t.dir/implicit-reg.mir
+# RUN: not --crash %{brace-s3-llc} -start-after=virtregrewriter \
+# RUN:   %t.dir/implicit-reg.mir -o %t.dir/implicit-reg.o
+# RUN: test ! -s %t.dir/implicit-reg.o
+#
+# Parser-valid MBB call-frame, address-taken, alignment and section state are
+# all outside the leaf ABI even when the instruction body is unchanged.
+# RUN: sed 's/bb.0.entry:/bb.0.entry (call-frame-size 8):/' \
+# RUN:   %t.dir/direct.mir > %t.dir/mbb-call-frame.mir
+# RUN: not --crash %{brace-s3-llc} -start-after=virtregrewriter \
+# RUN:   %t.dir/mbb-call-frame.mir -o %t.dir/mbb-call-frame.o
+# RUN: test ! -s %t.dir/mbb-call-frame.o
+# RUN: sed 's/bb.0.entry:/bb.0.entry (machine-block-address-taken):/' \
+# RUN:   %t.dir/direct.mir > %t.dir/mbb-address-taken.mir
+# RUN: not --crash %{brace-s3-llc} -start-after=virtregrewriter \
+# RUN:   %t.dir/mbb-address-taken.mir -o %t.dir/mbb-address-taken.o
+# RUN: test ! -s %t.dir/mbb-address-taken.o
+# RUN: sed 's/bb.0.entry:/bb.0.entry (align 4):/' \
+# RUN:   %t.dir/direct.mir > %t.dir/mbb-alignment.mir
+# RUN: not --crash %{brace-s3-llc} -start-after=virtregrewriter \
+# RUN:   %t.dir/mbb-alignment.mir -o %t.dir/mbb-alignment.o
+# RUN: test ! -s %t.dir/mbb-alignment.o
+# RUN: sed 's/bb.0.entry:/bb.0.entry (bbsections 1):/' \
+# RUN:   %t.dir/direct.mir > %t.dir/mbb-section.mir
+# RUN: not --crash %{brace-s3-llc} -start-after=virtregrewriter \
+# RUN:   %t.dir/mbb-section.mir -o %t.dir/mbb-section.o
+# RUN: test ! -s %t.dir/mbb-section.o
+#
+# The uniquely removable empty loop preheader is still validated before it is
+# erased; otherwise MBB state could be normalized out of the trust boundary.
+# RUN: awk '$0 == "  bb.0.entry:" { print; print "    liveins: $r0"; \
+# RUN:   next } { print }' %t.dir/poll.mir > %t.dir/empty-entry-livein.mir
+# RUN: not --crash %{brace-s3-llc} -start-after=virtregrewriter \
+# RUN:   %t.dir/empty-entry-livein.mir -o %t.dir/empty-entry-livein.o
+# RUN: test ! -s %t.dir/empty-entry-livein.o
+# RUN: awk '$0 == "  bb.1.while.cond:" { print; \
+# RUN:   print "    liveins: $r4"; next } \
+# RUN:   $0 == "    $r0 = PADDR_IMM 268435461" { \
+# RUN:   print "    $r5 = MOV32 $r4"; print; next } { print }' \
+# RUN:   %t.dir/poll.mir > %t.dir/forged-internal-livein.mir
+# RUN: not --crash %{brace-s3-llc} -start-after=virtregrewriter \
+# RUN:   %t.dir/forged-internal-livein.mir -o %t.dir/forged-internal-livein.o
+# RUN: test ! -s %t.dir/forged-internal-livein.o
+#
+# Machine CFG reachability and the memory-specific cap remain authoritative
+# after a MIR restart.
+# RUN: sed 's/^    RET$/    BR %bb.0\n    RET/' \
+# RUN:   %t.dir/direct.mir > %t.dir/nonfinal-terminator.mir
+# RUN: not --crash %{brace-s3-llc} -start-after=virtregrewriter \
+# RUN:   %t.dir/nonfinal-terminator.mir -o %t.dir/nonfinal-terminator.o
+# RUN: test ! -s %t.dir/nonfinal-terminator.o
+# RUN: awk '$0 == "    RET" { print; print ""; print "  bb.1:"; \
+# RUN:   print "    RET"; next } { print }' \
+# RUN:   %t.dir/direct.mir > %t.dir/unreachable-block.mir
+# RUN: not --crash %{brace-s3-llc} -start-after=virtregrewriter \
+# RUN:   %t.dir/unreachable-block.mir -o %t.dir/unreachable-block.o
+# RUN: test ! -s %t.dir/unreachable-block.o
+# RUN: awk '/^    STORE32 killed / { line=$0; \
+# RUN:   gsub("killed ", "", line); for (i=0; i<65; ++i) print line; \
+# RUN:   next } { print }' %t.dir/direct.mir > %t.dir/memory-limit.mir
+# RUN: not --crash %{brace-s3-llc} -start-after=virtregrewriter \
+# RUN:   %t.dir/memory-limit.mir -o %t.dir/memory-limit.o
+# RUN: test ! -s %t.dir/memory-limit.o
+#
+# The emitted-operation cap is independent of the IR and memory caps.  Repeat
+# a typed constant definition so the final post-RA program contains exactly
+# 128 operations, then require the 129th to fail before object publication.
+# RUN: awk '/^    \$r4 = CONST32 21845$/ { \
+# RUN:   for (i=0; i<125; ++i) print "    $r4 = CONST32 21845"; \
+# RUN:   next } { print }' %t.dir/direct.mir > %t.dir/operation-exact.mir
+# RUN: %{brace-s3-llc} -start-after=virtregrewriter \
+# RUN:   %t.dir/operation-exact.mir -o %t.dir/operation-exact.o
+# RUN: test -s %t.dir/operation-exact.o
+# RUN: llvm-readobj --sections %t.dir/operation-exact.o | \
+# RUN:   FileCheck %s --check-prefix=OPERATION-EXACT
+# RUN: wc -c < %t.dir/operation-exact.o | \
+# RUN:   FileCheck %s --check-prefix=OPERATION-OBJECT-SIZE
+# RUN: %python -c "import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], 'rb').read()).hexdigest())" \
+# RUN:   %t.dir/operation-exact.o | \
+# RUN:   FileCheck %s --check-prefix=OPERATION-OBJECT-SHA
+# RUN: awk '/^    \$r4 = CONST32 21845$/ { \
+# RUN:   for (i=0; i<126; ++i) print "    $r4 = CONST32 21845"; \
+# RUN:   next } { print }' %t.dir/direct.mir > %t.dir/operation-plus-one.mir
+# RUN: not --crash %{brace-s3-llc} -start-after=virtregrewriter \
+# RUN:   %t.dir/operation-plus-one.mir -o %t.dir/operation-plus-one.o
+# RUN: test ! -s %t.dir/operation-plus-one.o
+#
+# OPERATION-EXACT: Name: .brace.text
+# OPERATION-EXACT: Size: 512
+# OPERATION-OBJECT-SIZE: 1384
+# OPERATION-OBJECT-SHA: 1f95765bfc0a10bb279ff7f8eed589e4a4d531835b1d4b677b6657cb61e7a023

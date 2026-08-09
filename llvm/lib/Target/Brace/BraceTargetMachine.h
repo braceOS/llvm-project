@@ -9,16 +9,19 @@
 #ifndef LLVM_LIB_TARGET_BRACE_BRACETARGETMACHINE_H
 #define LLVM_LIB_TARGET_BRACE_BRACETARGETMACHINE_H
 
-#include "llvm/Target/TargetMachine.h"
+#include "BraceSubtarget.h"
+#include "llvm/CodeGen/CodeGenTargetMachineImpl.h"
 #include <memory>
 
 namespace llvm {
 
 class TargetLoweringObjectFile;
 
-class BraceTargetMachine final : public TargetMachine {
+class BraceTargetMachine final : public CodeGenTargetMachineImpl {
+  BraceSubtarget Subtarget;
   std::unique_ptr<TargetLoweringObjectFile> TLOF;
   bool UnsupportedConfiguration = false;
+  bool SdagLeafABI = false;
 
 public:
   BraceTargetMachine(const Target &T, const Triple &TT, StringRef CPU,
@@ -28,6 +31,12 @@ public:
                      bool JIT);
   ~BraceTargetMachine() override;
 
+  const BraceSubtarget *getSubtargetImpl(const Function &) const override {
+    return &Subtarget;
+  }
+
+  TargetPassConfig *createPassConfig(PassManagerBase &PM) override;
+
   TargetLoweringObjectFile *getObjFileLowering() const override {
     return TLOF.get();
   }
@@ -36,6 +45,13 @@ public:
                            raw_pwrite_stream *DwoOut, CodeGenFileType FileType,
                            bool DisableVerify,
                            MachineModuleInfoWrapperPass *MMIWP) override;
+
+  Expected<std::unique_ptr<MCStreamer>>
+  createMCStreamer(raw_pwrite_stream &Out, raw_pwrite_stream *DwoOut,
+                   CodeGenFileType FileType, MCContext &Ctx) override;
+
+  bool usesSdagLeafABI() const { return SdagLeafABI; }
+  bool isMachineVerifierClean() const override { return true; }
 };
 
 } // namespace llvm

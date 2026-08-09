@@ -9,11 +9,26 @@
 include "llvm/Target/Target.td"
 
 let Namespace = "Brace" in {
-def S2DummyReg : Register<"s2-dummy">;
-def S2DummyRegClass : RegisterClass<"Brace", [i64], 64, (add S2DummyReg)>;
+  class BraceReg<bits<16> encoding, string name> : Register<name> {
+    let HWEncoding = encoding;
+  }
+
+  def R0 : BraceReg<0, "r0">, DwarfRegNum<[0]>;
+  def R1 : BraceReg<1, "r1">, DwarfRegNum<[1]>;
+  def R2 : BraceReg<2, "r2">, DwarfRegNum<[2]>;
+  def R3 : BraceReg<3, "r3">, DwarfRegNum<[3]>;
+  def R4 : BraceReg<4, "r4">, DwarfRegNum<[4]>;
+  def R5 : BraceReg<5, "r5">, DwarfRegNum<[5]>;
+
+  // S3b.3 deliberately uses disjoint typed banks.  An S2 physical slot has one
+  // type for the whole program, so a conventional overlapping GPR class would
+  // allow register allocation to silently change the object semantics.
+  def PAddrRegs : RegisterClass<"Brace", [i64], 64, (add R0, R1)>;
+  def I8Regs : RegisterClass<"Brace", [i8], 8, (add R2, R3)>;
+  def I32Regs : RegisterClass<"Brace", [i32], 32, (add R4, R5)>;
 }
 
-defm : RemapAllTargetPseudoPointerOperands<S2DummyRegClass>;
+defm : RemapAllTargetPseudoPointerOperands<PAddrRegs>;
 
 def S2Imm : Operand<i64>;
 
@@ -41,6 +56,84 @@ def S2_PHYSICAL_LOAD : S2MCInst<"s2.physical-load",
     (ins S2Imm:$destination, S2Imm:$width, S2Imm:$address)>;
 def S2_PHYSICAL_STORE : S2MCInst<"s2.physical-store",
     (ins S2Imm:$width, S2Imm:$address, S2Imm:$source)>;
+
+def BraceImm8 : Operand<i8>;
+def BraceImm32 : Operand<i32>;
+def BraceImm64 : Operand<i64>;
+def BraceMBB : Operand<OtherVT>;
+
+class BraceMI<dag outs, dag ins, string mnemonic> : Instruction {
+  let Namespace = "Brace";
+  dag OutOperandList = outs;
+  dag InOperandList = ins;
+  let AsmString = mnemonic;
+  let Pattern = [];
+  let isCodeGenOnly = 1;
+}
+
+def CONST8 : BraceMI<(outs I8Regs:$dst), (ins BraceImm8:$value),
+                     "const8 $dst, $value">;
+def CONST32 : BraceMI<(outs I32Regs:$dst), (ins BraceImm32:$value),
+                      "const32 $dst, $value">;
+def PADDR_IMM : BraceMI<(outs PAddrRegs:$dst), (ins BraceImm64:$address),
+                        "paddr $dst, $address">;
+
+let Constraints = "$dst = $left" in {
+  def AND8 : BraceMI<(outs I8Regs:$dst), (ins I8Regs:$left, I8Regs:$right),
+                     "and8 $dst, $left, $right">;
+  def AND32 : BraceMI<(outs I32Regs:$dst), (ins I32Regs:$left, I32Regs:$right),
+                      "and32 $dst, $left, $right">;
+}
+
+def MOV8 : BraceMI<(outs I8Regs:$dst), (ins I8Regs:$src), "mov8 $dst, $src">;
+def MOV32
+    : BraceMI<(outs I32Regs:$dst), (ins I32Regs:$src), "mov32 $dst, $src">;
+
+let mayLoad = 1, hasSideEffects = 1 in {
+  def LOAD8 : BraceMI<(outs I8Regs:$dst), (ins PAddrRegs:$address),
+                      "load8 $dst, $address">;
+  def LOAD32 : BraceMI<(outs I32Regs:$dst), (ins PAddrRegs:$address),
+                       "load32 $dst, $address">;
+}
+
+let mayStore = 1, hasSideEffects = 1 in {
+  def STORE8 : BraceMI<(outs), (ins PAddrRegs:$address, I8Regs:$source),
+                       "store8 $address, $source">;
+  def STORE32 : BraceMI<(outs), (ins PAddrRegs:$address, I32Regs:$source),
+                        "store32 $address, $source">;
+}
+
+let isBranch = 1, isTerminator = 1 in {
+  let isBarrier =
+      1 in def BR : BraceMI<(outs), (ins BraceMBB:$target), "br $target">;
+
+  // BRCOND is an isel-only one-target branch.  BraceFinalizeBranches replaces
+  // it with the explicit two-target BR_IF required by S2 before publication.
+  def BRCOND8
+      : BraceMI<(outs),
+                (ins I8Regs:$condition, BraceMBB:$target, BraceImm8:$nonzero),
+                "brcond8 $condition, $target, $nonzero">;
+  def BRCOND32
+      : BraceMI<(outs),
+                (ins I32Regs:$condition, BraceMBB:$target, BraceImm8:$nonzero),
+                "brcond32 $condition, $target, $nonzero">;
+
+  let isBarrier = 1 in {
+    def BR_IF8 : BraceMI<(outs),
+                         (ins I8Regs:$condition, BraceMBB:$true_target,
+                             BraceMBB:$false_target),
+                         "br_if8 $condition, $true_target, $false_target">;
+    def BR_IF32 : BraceMI<(outs),
+                          (ins I32Regs:$condition, BraceMBB:$true_target,
+                              BraceMBB:$false_target),
+                          "br_if32 $condition, $true_target, $false_target">;
+  }
+}
+
+let isReturn = 1, isTerminator = 1,
+    isBarrier = 1 in def RET : BraceMI<(outs), (ins), "ret">;
+
+def CSR_NoRegs : CalleeSavedRegs<(add)>;
 
 def BraceInstrInfo : InstrInfo;
 

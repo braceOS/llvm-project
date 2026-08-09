@@ -1203,6 +1203,14 @@ void CodeGenModule::Release() {
     getModule().addModuleFlag(llvm::Module::Error, "min_enum_size", EnumWidth);
   }
 
+  if (T.getArch() == llvm::Triple::brace64) {
+    StringRef ABIStr = Target.getABI();
+    if (!ABIStr.empty())
+      getModule().addModuleFlag(
+          llvm::Module::Error, "target-abi",
+          llvm::MDString::get(TheModule.getContext(), ABIStr));
+  }
+
   if (T.isRISCV()) {
     StringRef ABIStr = Target.getABI();
     llvm::LLVMContext &Ctx = TheModule.getContext();

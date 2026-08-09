@@ -632,6 +632,15 @@ public:
   void makeDebugValueSubstitution(DebugInstrOperandPair, DebugInstrOperandPair,
                                   unsigned SubReg = 0);
 
+  /// Return whether MIR intake attached debug-only substitution state.  Most
+  /// targets preserve this for debug emission; closed publication profiles
+  /// can use the query to reject state their emitters do not consume.
+  bool hasDebugValueSubstitutions() const {
+    return !DebugValueSubstitutions.empty();
+  }
+
+  bool hasDebugPHIPositions() const { return !DebugPHIPositions.empty(); }
+
   /// Create substitutions for any tracked values in \p Old, to point at
   /// \p New. Needed when we re-create an instruction during optimization,
   /// which has the same signature (i.e., def operands in the same place) but

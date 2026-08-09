@@ -1,0 +1,144 @@
+//===-- BraceISelDAGToDAG.cpp - Brace DAG instruction selection ---------===//
+
+#include "Brace.h"
+#include "BraceISelLowering.h"
+#include "BraceTargetMachine.h"
+#include "MCTargetDesc/BraceMCTargetDesc.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/CodeGen/SelectionDAGISel.h"
+#include "llvm/IR/DiagnosticInfo.h"
+#include "llvm/Support/Debug.h"
+#include "llvm/Support/ErrorHandling.h"
+
+using namespace llvm;
+
+#define DEBUG_TYPE "brace-isel"
+
+namespace {
+
+class BraceDAGToDAGISel final : public SelectionDAGISel {
+public:
+  explicit BraceDAGToDAGISel(BraceTargetMachine &TM) : SelectionDAGISel(TM) {}
+
+  void Select(SDNode *Node) override;
+
+#include "BraceGenDAGISel.inc"
+};
+
+class BraceDAGToDAGISelLegacy final : public SelectionDAGISelLegacy {
+public:
+  static char ID;
+  explicit BraceDAGToDAGISelLegacy(BraceTargetMachine &TM)
+      : SelectionDAGISelLegacy(ID, std::make_unique<BraceDAGToDAGISel>(TM)) {}
+};
+
+} // namespace
+
+char BraceDAGToDAGISelLegacy::ID = 0;
+
+INITIALIZE_PASS(BraceDAGToDAGISelLegacy, DEBUG_TYPE,
+                "Brace SelectionDAG instruction selection", false, false)
+
+static void requirePhysicalMemory(const MemSDNode &Node) {
+  if (Node.getAddressSpace() != 200 || !Node.isVolatile() || Node.isAtomic())
+    report_fatal_error(
+        "brace64 S3b.3 leaf ABI requires volatile unindexed addrspace(200) "
+        "memory");
+}
+
+void BraceDAGToDAGISel::Select(SDNode *Node) {
+  if (Node->isMachineOpcode()) {
+    Node->setNodeId(-1);
+    return;
+  }
+
+  const SDLoc DL(Node);
+  switch (Node->getOpcode()) {
+  case ISD::Constant: {
+    const auto *Value = cast<ConstantSDNode>(Node);
+    const EVT VT = Node->getValueType(0);
+    unsigned Opcode = 0;
+    if (VT == MVT::i8)
+      Opcode = Brace::CONST8;
+    else if (VT == MVT::i32)
+      Opcode = Brace::CONST32;
+    else if (VT == MVT::i64)
+      Opcode = Brace::PADDR_IMM;
+    else
+      report_fatal_error(
+          "brace64 S3b.3 leaf ABI encountered an illegal constant type");
+    SDValue Immediate =
+        CurDAG->getTargetConstant(Value->getZExtValue(), DL, VT);
+    CurDAG->SelectNodeTo(Node, Opcode, VT, Immediate);
+    return;
+  }
+  case ISD::AND: {
+    const EVT VT = Node->getValueType(0);
+    unsigned Opcode =
+        VT == MVT::i8 ? Brace::AND8 : (VT == MVT::i32 ? Brace::AND32 : 0);
+    if (!Opcode)
+      report_fatal_error(
+          "brace64 S3b.3 leaf ABI only admits i8/i32 integer-and");
+    CurDAG->SelectNodeTo(Node, Opcode, VT, Node->getOperand(0),
+                         Node->getOperand(1));
+    return;
+  }
+  case ISD::LOAD: {
+    auto *Load = cast<LoadSDNode>(Node);
+    requirePhysicalMemory(*Load);
+    EVT VT = Load->getMemoryVT();
+    if (VT != Load->getValueType(0) || (VT != MVT::i8 && VT != MVT::i32))
+      report_fatal_error(
+          "brace64 S3b.3 leaf ABI only admits exact i8/i32 loads");
+    unsigned Opcode = VT == MVT::i8 ? Brace::LOAD8 : Brace::LOAD32;
+    SDNode *Selected = CurDAG->SelectNodeTo(
+        Node, Opcode, VT, MVT::Other, Load->getBasePtr(), Load->getChain());
+    CurDAG->setNodeMemRefs(cast<MachineSDNode>(Selected),
+                           {Load->getMemOperand()});
+    return;
+  }
+  case ISD::STORE: {
+    auto *Store = cast<StoreSDNode>(Node);
+    requirePhysicalMemory(*Store);
+    EVT VT = Store->getMemoryVT();
+    if (VT != Store->getValue().getValueType() ||
+        (VT != MVT::i8 && VT != MVT::i32))
+      report_fatal_error(
+          "brace64 S3b.3 leaf ABI only admits exact i8/i32 stores");
+    unsigned Opcode = VT == MVT::i8 ? Brace::STORE8 : Brace::STORE32;
+    SDNode *Selected =
+        CurDAG->SelectNodeTo(Node, Opcode, MVT::Other, Store->getBasePtr(),
+                             Store->getValue(), Store->getChain());
+    CurDAG->setNodeMemRefs(cast<MachineSDNode>(Selected),
+                           {Store->getMemOperand()});
+    return;
+  }
+  case ISD::BR:
+    CurDAG->SelectNodeTo(Node, Brace::BR, MVT::Other, Node->getOperand(1),
+                         Node->getOperand(0));
+    return;
+  case BraceISD::BR_CC: {
+    EVT VT = Node->getOperand(1).getValueType();
+    unsigned Opcode =
+        VT == MVT::i8 ? Brace::BRCOND8 : (VT == MVT::i32 ? Brace::BRCOND32 : 0);
+    if (!Opcode)
+      report_fatal_error(
+          "brace64 S3b.3 leaf ABI encountered an illegal branch type");
+    SmallVector<SDValue, 4> Operands{Node->getOperand(1), Node->getOperand(2),
+                                     Node->getOperand(3), Node->getOperand(0)};
+    CurDAG->SelectNodeTo(Node, Opcode, MVT::Other, Operands);
+    return;
+  }
+  case BraceISD::RET:
+    CurDAG->SelectNodeTo(Node, Brace::RET, MVT::Other, Node->getOperand(0));
+    return;
+  default:
+    break;
+  }
+
+  SelectCode(Node);
+}
+
+FunctionPass *llvm::createBraceISelDag(BraceTargetMachine &TM) {
+  return new BraceDAGToDAGISelLegacy(TM);
+}

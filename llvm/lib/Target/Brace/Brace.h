@@ -11,11 +11,23 @@
 
 namespace llvm {
 
+class BraceTargetMachine;
+class FunctionPass;
+class Module;
 class ModulePass;
+class PassRegistry;
 class raw_pwrite_stream;
 class TargetMachine;
 
 ModulePass *createBraceS2WriterPass(TargetMachine &TM, raw_pwrite_stream &Out);
+ModulePass *createBraceS3IRVerifierPass(const BraceTargetMachine &TM);
+void verifyBraceS3IRModule(const Module &M);
+void verifyBraceS3LateModuleEnvelope(const Module &M);
+FunctionPass *createBraceISelDag(BraceTargetMachine &TM);
+FunctionPass *createBraceFinalizeBranchesPass();
+
+void initializeBraceDAGToDAGISelLegacyPass(PassRegistry &);
+void initializeBraceFinalizeBranchesLegacyPass(PassRegistry &);
 
 } // namespace llvm
 

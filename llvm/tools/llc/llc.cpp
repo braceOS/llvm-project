@@ -594,6 +594,7 @@ static int compileModule(char **argv, SmallVectorImpl<PassPlugin> &PluginList,
 
   const Target *TheTarget = nullptr;
   std::unique_ptr<TargetMachine> Target;
+  bool RejectedBraceS3InputEnvelope = false;
 
   // If user just wants to list available options, skip module loading
   if (!SkipModule) {
@@ -616,6 +617,15 @@ static int compileModule(char **argv, SmallVectorImpl<PassPlugin> &PluginList,
       }
 
       InitializeOptions(TheTriple);
+      if (Options.MCOptions.getABIName() == "brace-system-s2-leaf-r0" &&
+          (Triple::normalize(DataLayoutTargetTriple) !=
+               "brace64-unknown-none-elf" ||
+           OldDLStr != "e-m:e-p:64:64-i64:64-i128:128-n32:64-S128")) {
+        if (!RejectedBraceS3InputEnvelope)
+          WithColor::error(errs(), argv[0])
+              << "brace64 S3b.3 input triple or data layout mismatch\n";
+        RejectedBraceS3InputEnvelope = true;
+      }
       Target = std::unique_ptr<TargetMachine>(TheTarget->createTargetMachine(
           TheTriple, CPUStr, FeaturesStr, Options, RM, CM, OLvl));
       assert(Target && "Could not allocate target machine!");
@@ -639,6 +649,8 @@ static int compileModule(char **argv, SmallVectorImpl<PassPlugin> &PluginList,
       Err.print(argv[0], WithColor::error(errs(), argv[0]));
       return 1;
     }
+    if (RejectedBraceS3InputEnvelope)
+      return 1;
     if (!TargetTriple.empty())
       M->setTargetTriple(Triple(Triple::normalize(TargetTriple)));
 

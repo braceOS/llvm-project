@@ -24,6 +24,8 @@ namespace clang {
 namespace targets {
 
 class LLVM_LIBRARY_VISIBILITY Brace64TargetInfo final : public TargetInfo {
+  std::string ABI;
+
 public:
   Brace64TargetInfo(const llvm::Triple &Triple, const TargetOptions &)
       : TargetInfo(Triple) {
@@ -61,6 +63,15 @@ public:
   }
 
   bool setCPU(const std::string &Name) override { return isValidCPUName(Name); }
+
+  StringRef getABI() const override { return ABI; }
+
+  bool setABI(const std::string &Name) override {
+    if (Name != "brace-system-s2-leaf-r0")
+      return false;
+    ABI = Name;
+    return true;
+  }
 
   llvm::SmallVector<Builtin::InfosShard> getTargetBuiltins() const override {
     return {};

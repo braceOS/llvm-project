@@ -1543,6 +1543,10 @@ void Clang::RenderTargetOptions(const llvm::Triple &EffectiveTriple,
     AddAArch64TargetArgs(Args, CmdArgs);
     break;
 
+  case llvm::Triple::brace64:
+    AddBraceTargetArgs(Args, CmdArgs);
+    break;
+
   case llvm::Triple::loongarch32:
   case llvm::Triple::loongarch64:
     AddLoongArchTargetArgs(Args, CmdArgs);
@@ -2004,6 +2008,23 @@ void Clang::AddPPCTargetArgs(const ArgList &Args,
     CmdArgs.push_back("-target-abi");
     CmdArgs.push_back(ABIName);
   }
+}
+
+void Clang::AddBraceTargetArgs(const ArgList &Args,
+                               ArgStringList &CmdArgs) const {
+  const Arg *A = Args.getLastArg(options::OPT_mabi_EQ);
+  if (!A)
+    return;
+
+  StringRef ABIName = A->getValue();
+  if (ABIName != "brace-system-s2-leaf-r0") {
+    getToolChain().getDriver().Diag(diag::err_drv_unsupported_option_argument)
+        << A->getSpelling() << ABIName;
+    return;
+  }
+
+  CmdArgs.push_back("-target-abi");
+  CmdArgs.push_back(Args.MakeArgString(ABIName));
 }
 
 void Clang::AddRISCVTargetArgs(const ArgList &Args,
