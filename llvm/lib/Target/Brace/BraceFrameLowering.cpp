@@ -23,7 +23,7 @@ bool hasOnlyDeadSpillObjects(const MachineFrameInfo &Frame) {
   for (int FI = Frame.getObjectIndexBegin(); FI != Frame.getObjectIndexEnd();
        ++FI)
     if (!Frame.isDeadObjectIndex(FI) || !Frame.isSpillSlotObjectIndex(FI) ||
-        Frame.getObjectAllocation(FI))
+        Frame.getObjectAllocation(FI) || Frame.isAliasedObjectIndex(FI))
       return false;
   return true;
 }

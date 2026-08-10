@@ -763,6 +763,7 @@ public:
            FI != Frame.getObjectIndexEnd(); ++FI)
         if (!Frame.isDeadObjectIndex(FI) || !Frame.isSpillSlotObjectIndex(FI) ||
             Frame.getObjectAllocation(FI) ||
+            Frame.isAliasedObjectIndex(FI) ||
             Frame.getStackID(FI) != TargetStackID::Default)
           reject("non-dead or non-spill frame object survived S3b.4");
     }

@@ -9,6 +9,11 @@
 ; DEFINE:   -target-abi=brace-system-s2-leaf-home-r0 -O1 \
 ; DEFINE:   -verify-machineinstrs -filetype=obj
 ; RUN: rm -rf %t && split-file %s %t
+; RUN: %python %t/check-alias-guards.py \
+; RUN:   %llvm_src_root/lib/Target/Brace/BraceInstrInfo.cpp \
+; RUN:   %llvm_src_root/lib/Target/Brace/BraceFinalizeSpillHomes.cpp \
+; RUN:   %llvm_src_root/lib/Target/Brace/BraceFinalizeBranches.cpp \
+; RUN:   %llvm_src_root/lib/Target/Brace/BraceFrameLowering.cpp
 ;
 ; RUN: %{brace-s3b4-llc} -stop-after=virtregrewriter %t/i32.ll \
 ; RUN:   -o %t/i32.pre.mir
@@ -137,6 +142,15 @@
 ; RUN:   %t/nonspill.mir -o %t/nonspill.o 2>&1 | \
 ; RUN:   FileCheck %s --check-prefix=NONSPILL
 ; RUN: test ! -s %t/nonspill.o
+; An explicit alias bit is not part of the ordinary stack-object MIR schema.
+; Freeze that parser rejection separately from the internal MachineFrameInfo
+; guards audited above; neither path claims serialized creator provenance.
+; RUN: sed '1,/type: spill-slot/s/type: spill-slot/type: spill-slot, isAliased: true/' \
+; RUN:   %t/i32.pre.mir > %t/aliased.mir
+; RUN: not %{brace-s3b4-llc} -start-after=virtregrewriter \
+; RUN:   %t/aliased.mir -o %t/aliased.o 2>&1 | \
+; RUN:   FileCheck %s --check-prefix=ALIASED-PARSER
+; RUN: test ! -s %t/aliased.o
 ; RUN: sed 's/isCalleeSavedInfoValid: false/isCalleeSavedInfoValid: true/' \
 ; RUN:   %t/i32.pre.mir > %t/callee-saved-pre.mir
 ; RUN: not --crash %{brace-s3b4-llc} -start-after=virtregrewriter \
@@ -261,6 +275,8 @@
 ; TYPE: LLVM ERROR: brace64 S3b.3 post-RA verifier: semantic home is reused across value types
 ; RANGE: LLVM ERROR: brace64 S3b.3 post-RA verifier: semantic-home ordinal is outside 0..19
 ; NONSPILL: LLVM ERROR: brace64 S3b.4 spill-home finalizer: spill pseudo refers to a noncanonical spill frame index
+; ALIASED-PARSER: error: YAML:
+; ALIASED-PARSER-SAME: unknown key 'isAliased'
 ; CALLEE-SAVED-PRE: LLVM ERROR: brace64 S3b.4 spill-home finalizer: non-spill stack, frame, or call state is forbidden
 ; CALLEE-SAVED-POST: LLVM ERROR: brace64 S3b.4 post-home frame verifier: noncanonical pre-PEI frame state is forbidden
 ; CALL-FRAME-PRE: LLVM ERROR: brace64 S3b.4 spill-home finalizer: non-spill stack, frame, or call state is forbidden
@@ -408,6 +424,31 @@ source = source.replace("entry_values:    []\n", "".join(objects) +
 source = source.replace("    RET\n...\n", "".join(operations) +
                         "    RET\n...\n")
 output.write_text(source)
+
+;--- check-alias-guards.py
+import pathlib
+import sys
+
+instr_info = pathlib.Path(sys.argv[1]).read_text()
+finalizer = pathlib.Path(sys.argv[2]).read_text()
+publication = pathlib.Path(sys.argv[3]).read_text()
+frame_lowering = pathlib.Path(sys.argv[4]).read_text()
+
+expected = (
+    (instr_info, "Frame.isAliasedObjectIndex(FrameIndex)", 1,
+     "spill callback"),
+    (finalizer, "Frame.isAliasedObjectIndex(FrameIndex)", 1,
+     "spill transfer"),
+    (finalizer, "Frame.isAliasedObjectIndex(FI)", 2,
+     "pre/post object sweeps"),
+    (publication, "Frame.isAliasedObjectIndex(FI)", 1,
+     "late publication sweep"),
+    (frame_lowering, "Frame.isAliasedObjectIndex(FI)", 1,
+     "frame-lowering dead-object sweep"),
+)
+for source, needle, count, role in expected:
+    if source.count(needle) != count:
+        raise SystemExit("missing exact internal alias guard: " + role)
 
 ;--- i8.ll
 target datalayout = "e-m:e-p:64:64-i64:64-i128:128-n32:64-S128"

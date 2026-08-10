@@ -50,6 +50,7 @@ void verifySpillFrameIndex(const MachineFunction &MF, int FrameIndex,
       Frame.isDeadObjectIndex(FrameIndex) ||
       !Frame.isSpillSlotObjectIndex(FrameIndex) ||
       Frame.getObjectAllocation(FrameIndex) ||
+      Frame.isAliasedObjectIndex(FrameIndex) ||
       Frame.getObjectSize(FrameIndex) != TRI.getSpillSize(*RC) ||
       Frame.getObjectAlign(FrameIndex) != TRI.getSpillAlign(*RC))
     report_fatal_error(

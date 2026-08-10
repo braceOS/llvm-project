@@ -133,6 +133,7 @@ void verifySpillInstruction(const MachineInstr &MI, MachineFrameInfo &Frame,
       Frame.isDeadObjectIndex(FrameIndex) ||
       !Frame.isSpillSlotObjectIndex(FrameIndex) ||
       Frame.getObjectAllocation(FrameIndex) ||
+      Frame.isAliasedObjectIndex(FrameIndex) ||
       Frame.getStackID(FrameIndex) != TargetStackID::Default ||
       Frame.getObjectSize(FrameIndex) != Bytes ||
       Frame.getObjectAlign(FrameIndex) != Align(Bytes))
@@ -181,6 +182,7 @@ public:
          ++FI) {
       if (FI < 0 || !Frame.isSpillSlotObjectIndex(FI) ||
           Frame.getObjectAllocation(FI) ||
+          Frame.isAliasedObjectIndex(FI) ||
           Frame.getStackID(FI) != TargetStackID::Default)
         reject("non-spill frame object survived register allocation");
       if (!Frame.isDeadObjectIndex(FI) && !Spills.contains(FI))
@@ -272,6 +274,7 @@ public:
       if (FI < 0 || !Frame.isDeadObjectIndex(FI) ||
           !Frame.isSpillSlotObjectIndex(FI) ||
           Frame.getObjectAllocation(FI) ||
+          Frame.isAliasedObjectIndex(FI) ||
           Frame.getStackID(FI) != TargetStackID::Default)
         rejectPostHome("live or non-spill frame object survived finalization");
     return false;
