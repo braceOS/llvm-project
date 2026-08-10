@@ -65,7 +65,11 @@ public:
 
   void addPostRegAlloc() override {
     if (getBraceTargetMachine().usesSdagLeafHomeABI()) {
+      addPass(createMachineVerifierPass(
+          "Before Brace S3b.4 spill-home finalization"));
       addPass(createBraceFinalizeSpillHomesPass());
+      addPass(createMachineVerifierPass(
+          "After Brace S3b.4 spill-home finalization"));
       addPass(createBraceVerifyPostHomeFramePass());
     }
   }
