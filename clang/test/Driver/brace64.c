@@ -7,9 +7,36 @@
 // RUN: %clang -### --target=brace64-unknown-none-elf -ffreestanding \
 // RUN:   -nostdinc -c -emit-llvm -mabi=brace-system-s2-leaf-home-r0 %s \
 // RUN:   2>&1 | FileCheck -check-prefix=HOME-ABI %s
+// RUN: %clang -### --target=brace64-unknown-none-elf -ffreestanding \
+// RUN:   -nostdinc -c -emit-llvm -mabi=brace-system-s2-direct-call-r0 %s \
+// RUN:   2>&1 | FileCheck -check-prefix=CALL-ABI %s
 // RUN: not %clang -### --target=brace64-unknown-none-elf -ffreestanding \
 // RUN:   -nostdinc -c -emit-llvm -mabi=not-brace %s 2>&1 | \
 // RUN:   FileCheck -check-prefix=BAD-ABI %s
+// RUN: not %clang -### --target=brace64-unknown-none-elf -ffreestanding \
+// RUN:   -nostdinc -c -Xclang -target-abi \
+// RUN:   -Xclang brace-system-s2-direct-call-r0 %s 2>&1 | \
+// RUN:   FileCheck -check-prefix=XCLANG-ABI %s
+// RUN: not %clang -### --target=brace64-unknown-none-elf -ffreestanding \
+// RUN:   -nostdinc -c -mabi=brace-system-s2-leaf-r0 \
+// RUN:   -Xclang -target-abi -Xclang brace-system-s2-direct-call-r0 %s \
+// RUN:   2>&1 | FileCheck -check-prefix=XCLANG-ABI %s
+// RUN: not %clang -### --target=brace64-unknown-none-elf -ffreestanding \
+// RUN:   -nostdinc -c -mabi=brace-system-s2-direct-call-r0 \
+// RUN:   -Xclang -target-abi -Xclang brace-system-s2-leaf-r0 %s 2>&1 | \
+// RUN:   FileCheck -check-prefix=XCLANG-ABI %s
+// RUN: not %clang -### --target=brace64-unknown-none-elf -ffreestanding \
+// RUN:   -nostdinc -c -mabi=brace-system-s2-direct-call-r0 \
+// RUN:   -Xclang -target-abi -Xclang brace-system-s2-direct-call-r0 %s \
+// RUN:   2>&1 | FileCheck -check-prefix=XCLANG-ABI %s
+// RUN: not %clang -### --target=brace64-unknown-none-elf -ffreestanding \
+// RUN:   -nostdinc -c -Xclang -target-abi \
+// RUN:   -Xclang brace-system-s2-direct-call-r0 -mllvm -verify-machineinstrs \
+// RUN:   %s 2>&1 | FileCheck -check-prefix=XCLANG-ABI %s
+// RUN: not %clang -### --target=brace64-unknown-none-elf -ffreestanding \
+// RUN:   -nostdinc -c -Xclang -target-abi \
+// RUN:   -Xclang brace-system-s2-direct-call-r0 -fexceptions %s 2>&1 | \
+// RUN:   FileCheck -check-prefix=XCLANG-ABI %s
 // RUN: %clang --target=brace64-unknown-none-elf -ffreestanding -nostdinc \
 // RUN:   -S -emit-llvm -o - %s | FileCheck -check-prefix=IR %s
 // RUN: not %clang --target=brace-unknown-none-elf -fsyntax-only %s \
@@ -28,7 +55,13 @@
 // HOME-ABI-SAME: "-triple" "brace64-unknown-none-elf"
 // HOME-ABI-SAME: "-target-abi" "brace-system-s2-leaf-home-r0"
 
+// CALL-ABI: "-cc1"
+// CALL-ABI-SAME: "-triple" "brace64-unknown-none-elf"
+// CALL-ABI-SAME: "-target-abi" "brace-system-s2-direct-call-r0"
+
 // BAD-ABI: error: unsupported argument 'not-brace' to option '-mabi='
+
+// XCLANG-ABI: error: unsupported option '-Xclang -target-abi' for target 'brace64-unknown-none-elf'
 
 // IR: target datalayout = "e-m:e-p:64:64-i64:64-i128:128-n32:64-S128"
 // IR-NEXT: target triple = "brace64-unknown-none-elf"

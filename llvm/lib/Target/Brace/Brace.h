@@ -15,6 +15,7 @@ namespace llvm {
 
 class BraceTargetMachine;
 class FunctionPass;
+class MachineFunction;
 class Module;
 class ModulePass;
 class PassRegistry;
@@ -25,6 +26,10 @@ ModulePass *createBraceS2WriterPass(TargetMachine &TM, raw_pwrite_stream &Out);
 ModulePass *createBraceS3IRVerifierPass(const BraceTargetMachine &TM);
 void verifyBraceS3IRModule(const Module &M, StringRef RequiredABI);
 void verifyBraceS3LateModuleEnvelope(const Module &M, StringRef RequiredABI);
+void verifyBraceS3FinalMachineFunctionEnvelope(MachineFunction &MF,
+                                               bool AllowsHomes,
+                                               bool DirectCall,
+                                               StringRef RequiredABI);
 FunctionPass *createBraceISelDag(BraceTargetMachine &TM);
 FunctionPass *createBraceFinalizeSpillHomesPass();
 FunctionPass *createBraceVerifyPostHomeFramePass();
@@ -38,10 +43,16 @@ void initializeBraceFinalizeBranchesLegacyPass(PassRegistry &);
 inline constexpr StringLiteral BraceSdagLeafABIName = "brace-system-s2-leaf-r0";
 inline constexpr StringLiteral BraceSdagLeafHomeABIName =
     "brace-system-s2-leaf-home-r0";
+inline constexpr StringLiteral BraceSdagDirectCallABIName =
+    "brace-system-s2-direct-call-r0";
 inline constexpr StringLiteral BraceSdagLeafHomeCompilerIdentity =
     "brace.exp.llvm22.brace64.system.r32-physical.sdag-leaf-spill-home@0";
 inline constexpr StringLiteral BraceSdagLeafHomeCodegenProfile =
     "brace.exp.llvm22.brace64.system.leaf-spill-home-codegen@0";
+inline constexpr StringLiteral BraceSdagDirectCallCompilerIdentity =
+    "brace.exp.llvm22.brace64.system.r32-physical.sdag-direct-call@0";
+inline constexpr StringLiteral BraceSdagDirectCallCodegenProfile =
+    "brace.exp.llvm22.brace64.system.direct-call-codegen@0";
 
 } // namespace llvm
 

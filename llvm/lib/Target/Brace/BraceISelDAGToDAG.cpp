@@ -132,6 +132,19 @@ void BraceDAGToDAGISel::Select(SDNode *Node) {
   case BraceISD::RET:
     CurDAG->SelectNodeTo(Node, Brace::RET, MVT::Other, Node->getOperand(0));
     return;
+  case BraceISD::RET_VALUE: {
+    SmallVector<SDValue, 3> Operands{Node->getOperand(1), Node->getOperand(0),
+                                     Node->getOperand(2)};
+    CurDAG->SelectNodeTo(Node, Brace::RET_I32, MVT::Other, Operands);
+    return;
+  }
+  case BraceISD::CALL: {
+    SmallVector<SDValue, 4> Operands{Node->getOperand(1), Node->getOperand(2),
+                                     Node->getOperand(0), Node->getOperand(3)};
+    CurDAG->SelectNodeTo(Node, Brace::CALL_I32,
+                         CurDAG->getVTList(MVT::Other, MVT::Glue), Operands);
+    return;
+  }
   default:
     break;
   }

@@ -26,6 +26,7 @@ namespace {
 class BraceAsmPrinter final : public AsmPrinter {
   DenseMap<const MachineBasicBlock *, uint32_t> BlockStarts;
   bool AllowsHomes;
+  bool DirectCall;
 
 public:
   static char ID;
@@ -33,12 +34,15 @@ public:
   BraceAsmPrinter(TargetMachine &TM, std::unique_ptr<MCStreamer> Streamer)
       : AsmPrinter(TM, std::move(Streamer), ID),
         AllowsHomes(
-            static_cast<BraceTargetMachine &>(TM).usesSdagLeafHomeABI()) {}
+            static_cast<BraceTargetMachine &>(TM).usesSdagLeafHomeABI()),
+        DirectCall(
+            static_cast<BraceTargetMachine &>(TM).usesSdagDirectCallABI()) {}
 
   StringRef getPassName() const override {
     return "Brace S3b.3 S2 Assembly Printer";
   }
 
+  bool doInitialization(Module &M) override;
   bool runOnMachineFunction(MachineFunction &MF) override;
   void emitInstruction(const MachineInstr *) override {
     llvm_unreachable("BraceAsmPrinter uses its bounded whole-function path");
@@ -56,6 +60,16 @@ private:
 } // namespace
 
 char BraceAsmPrinter::ID = 0;
+
+bool BraceAsmPrinter::doInitialization(Module &M) {
+  // Legacy pass managers initialize every FunctionPass before running the
+  // preceding module verifier.  AsmPrinter's base initialization consumes
+  // module asm, so recheck the direct-call module envelope before delegating
+  // and before any untrusted module-level payload reaches MC.
+  if (DirectCall)
+    verifyBraceS3LateModuleEnvelope(M, BraceSdagDirectCallABIName);
+  return AsmPrinter::doInitialization(M);
+}
 
 uint64_t BraceAsmPrinter::slot(Register Reg) const {
   switch (Reg) {
@@ -157,6 +171,24 @@ void BraceAsmPrinter::emitS2(const MachineInstr &MI) {
   case Brace::RET:
     emitMC(Brace::S2_RETURN, {});
     return;
+  case Brace::RET_I32:
+    emitMC(Brace::S2_RETURN_VALUE, {Reg(0)});
+    return;
+  case Brace::CALL_I32: {
+    const MachineOperand &Callee = MI.getOperand(0);
+    if (!Callee.isGlobal() ||
+        Callee.getGlobal()->getName() != "brace_system_call_leaf" ||
+        Callee.getOffset() != 0) {
+      OutContext.reportError(
+          SMLoc(), "brace64 S3b.5 call target is not the private leaf");
+      return;
+    }
+    const uint64_t TargetFunction =
+        Callee.getGlobal()->getName() == "brace_system_call_leaf" ? 1 : 0;
+    emitMC(Brace::S2_DIRECT_CALL,
+           {TargetFunction, Reg(/*result=*/2), Reg(/*argument=*/3)});
+    return;
+  }
   default:
     OutContext.reportError(
         SMLoc(), "brace64 S3b.3 AsmPrinter received an unknown MachineInstr");
@@ -232,6 +264,9 @@ bool BraceAsmPrinter::collectRegisterTypes(const MachineFunction &MF,
 
 bool BraceAsmPrinter::runOnMachineFunction(MachineFunction &Function) {
   SetupMachineFunction(Function);
+  if (DirectCall)
+    verifyBraceS3FinalMachineFunctionEnvelope(
+        Function, AllowsHomes, DirectCall, BraceSdagDirectCallABIName);
   BlockStarts.clear();
 
   uint32_t Operation = 0;
@@ -256,9 +291,36 @@ bool BraceAsmPrinter::runOnMachineFunction(MachineFunction &Function) {
   SmallVector<uint8_t, 26> RegisterTypes;
   if (!collectRegisterTypes(Function, RegisterTypes))
     return false;
-  if (Error E = TargetStreamer->setHeader(RegisterTypes,
-                                          blockStart(&Function.front()),
-                                          Brace::S2RelocationBase)) {
+  Error HeaderError = Error::success();
+  if (DirectCall) {
+    uint32_t FunctionIndex = 0;
+    uint32_t ResultKind = 0;
+    SmallVector<uint8_t, 1> Parameters;
+    SmallVector<uint32_t, 4> FunctionBlockStarts;
+    for (const MachineBasicBlock &MBB : Function)
+      FunctionBlockStarts.push_back(blockStart(&MBB));
+    if (Function.getName() == "brace_system_entry") {
+      FunctionIndex = 0;
+    } else if (Function.getName() == "brace_system_call_leaf") {
+      FunctionIndex = 1;
+      ResultKind = 2;
+      Parameters.push_back(4);
+    } else {
+      OutContext.reportError(SMLoc(),
+                             "brace64 S3b.5 encountered an unknown function");
+      return false;
+    }
+    consumeError(std::move(HeaderError));
+    HeaderError = TargetStreamer->beginDirectFunction(
+        FunctionIndex, RegisterTypes, blockStart(&Function.front()), ResultKind,
+        Parameters, FunctionBlockStarts, Brace::S2RelocationBase);
+  } else {
+    consumeError(std::move(HeaderError));
+    HeaderError = TargetStreamer->setHeader(
+        RegisterTypes, blockStart(&Function.front()), Brace::S2RelocationBase);
+  }
+  if (HeaderError) {
+    Error E = std::move(HeaderError);
     OutContext.reportError(SMLoc(), toString(std::move(E)));
     return false;
   }

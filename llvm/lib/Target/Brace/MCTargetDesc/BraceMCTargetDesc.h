@@ -17,6 +17,7 @@
 #include "llvm/Support/Error.h"
 #include <cstdint>
 #include <memory>
+#include <optional>
 
 namespace llvm {
 
@@ -43,15 +44,35 @@ enum PhysicalWidth : unsigned {
 
 constexpr uint64_t S2RelocationBase = UINT64_C(0x40000000);
 
+enum class S2ObjectMode : uint8_t {
+  Legacy,
+  DirectCall,
+};
+
+struct S2DirectFunction final {
+  SmallVector<uint8_t, 26> RegisterTypes;
+  SmallVector<MCInst, 128> Instructions;
+  SmallVector<uint8_t, 4> ParameterSlots;
+  SmallVector<uint32_t, 4> BlockStarts;
+  uint32_t Entry = 0;
+  uint32_t ResultKind = 0;
+  bool Present = false;
+};
+
 class S2ObjectWriter final : public MCObjectWriter {
   raw_pwrite_stream &Out;
+  S2ObjectMode Mode;
 
 public:
-  explicit S2ObjectWriter(raw_pwrite_stream &Out);
+  explicit S2ObjectWriter(raw_pwrite_stream &Out, S2ObjectMode Mode);
 
   Error writeExact(ArrayRef<uint8_t> RegisterTypes,
                    ArrayRef<MCInst> Instructions, uint32_t Entry,
                    uint64_t RelocationBase);
+  Error writeDirectCallExact(ArrayRef<S2DirectFunction> Functions,
+                             uint32_t EntryFunction, uint64_t RelocationBase);
+
+  S2ObjectMode getMode() const { return Mode; }
 
   uint64_t writeObject() override;
 };
@@ -62,16 +83,23 @@ class S2TargetStreamer final : public MCTargetStreamer {
   uint32_t Entry = 0;
   uint64_t RelocationBase = S2RelocationBase;
   bool HasHeader = false;
+  SmallVector<S2DirectFunction, 2> DirectFunctions;
+  std::optional<unsigned> CurrentDirectFunction;
 
 public:
   explicit S2TargetStreamer(MCStreamer &S) : MCTargetStreamer(S) {}
 
   Error setHeader(ArrayRef<uint8_t> Types, uint32_t EntryBlock, uint64_t Base);
+  Error beginDirectFunction(uint32_t FunctionIndex, ArrayRef<uint8_t> Types,
+                            uint32_t EntryOperation, uint32_t ResultKind,
+                            ArrayRef<uint8_t> ParameterSlots,
+                            ArrayRef<uint32_t> BlockStarts, uint64_t Base);
   Error emitInstruction(const MCInst &Inst);
   Error writeObject(S2ObjectWriter &Writer) const;
 };
 
-std::unique_ptr<S2ObjectWriter> createS2ObjectWriter(raw_pwrite_stream &Out);
+std::unique_ptr<S2ObjectWriter> createS2ObjectWriter(raw_pwrite_stream &Out,
+                                                     S2ObjectMode Mode);
 
 MCStreamer *createS2ELFStreamer(const Triple &TT, MCContext &Context,
                                 std::unique_ptr<MCAsmBackend> &&Backend,

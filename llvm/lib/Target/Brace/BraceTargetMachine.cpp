@@ -103,12 +103,15 @@ BraceTargetMachine::BraceTargetMachine(const Target &T, const Triple &TT,
     SdagABI = SdagABIKind::Leaf;
   else if (ABI == BraceSdagLeafHomeABIName)
     SdagABI = SdagABIKind::LeafHome;
+  else if (ABI == BraceSdagDirectCallABIName)
+    SdagABI = SdagABIKind::DirectCall;
   UnsupportedConfiguration =
-      (RM && *RM != Reloc::Static) || (CM && *CM != CodeModel::Small) || JIT ||
-      OL != CodeGenOptLevel::Less || (!CPU.empty() && CPU != "generic") ||
-      !FS.empty() ||
+      (RM && *RM != Reloc::Static) ||
+      (SdagABI == SdagABIKind::DirectCall && CM.has_value()) ||
+      (CM && *CM != CodeModel::Small) || JIT || OL != CodeGenOptLevel::Less ||
+      (!CPU.empty() && CPU != "generic") || !FS.empty() ||
       (!ABI.empty() && ABI != BraceSdagLeafABIName &&
-       ABI != BraceSdagLeafHomeABIName);
+       ABI != BraceSdagLeafHomeABIName && ABI != BraceSdagDirectCallABIName);
   initAsmInfo();
   setFastISel(false);
   setO0WantsFastISel(false);
@@ -124,6 +127,8 @@ StringRef BraceTargetMachine::getSdagABIName() const {
     return BraceSdagLeafABIName;
   case SdagABIKind::LeafHome:
     return BraceSdagLeafHomeABIName;
+  case SdagABIKind::DirectCall:
+    return BraceSdagDirectCallABIName;
   }
   llvm_unreachable("unknown Brace SelectionDAG ABI");
 }
@@ -165,9 +170,14 @@ BraceTargetMachine::createMCStreamer(raw_pwrite_stream &Out,
                                      CodeGenFileType FileType, MCContext &Ctx) {
   if (!usesSdagABI() || DwoOut || FileType != CodeGenFileType::ObjectFile)
     return createStringError(
-        "brace64 S3b.3 only admits target-local S2 object emission");
+        "brace64 SelectionDAG profiles only admit target-local S2 object "
+        "emission");
 
-  std::unique_ptr<MCObjectWriter> Writer = Brace::createS2ObjectWriter(Out);
+  const Brace::S2ObjectMode Mode = usesSdagDirectCallABI()
+                                       ? Brace::S2ObjectMode::DirectCall
+                                       : Brace::S2ObjectMode::Legacy;
+  std::unique_ptr<MCObjectWriter> Writer =
+      Brace::createS2ObjectWriter(Out, Mode);
   MCStreamer *Streamer = getTarget().createMCObjectStreamer(
       getTargetTriple(), Ctx, /*Backend=*/nullptr, std::move(Writer),
       /*Emitter=*/nullptr, *getMCSubtargetInfo());

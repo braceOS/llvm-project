@@ -441,7 +441,8 @@ Error lowerAndWrite(Module &M, TargetMachine &TM, MCContext &Context,
   const MCSubtargetInfo *STI = TM.getMCSubtargetInfo();
   if (!STI)
     return reject("TargetMachine has no MC subtarget information");
-  std::unique_ptr<MCObjectWriter> Writer = Brace::createS2ObjectWriter(Out);
+  std::unique_ptr<MCObjectWriter> Writer =
+      Brace::createS2ObjectWriter(Out, Brace::S2ObjectMode::Legacy);
   std::unique_ptr<MCStreamer> Streamer(TM.getTarget().createMCObjectStreamer(
       TT, Context, nullptr, std::move(Writer), nullptr, *STI));
   if (!Streamer || !Streamer->getTargetStreamer())

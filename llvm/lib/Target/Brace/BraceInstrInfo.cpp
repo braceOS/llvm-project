@@ -26,6 +26,11 @@ bool usesSpillHomes(const MachineFunction &MF) {
          BraceSdagLeafHomeABIName;
 }
 
+bool allowsPAddrRematerialization(const MachineFunction &MF) {
+  const StringRef ABI = MF.getTarget().Options.MCOptions.getABIName();
+  return ABI == BraceSdagLeafHomeABIName || ABI == BraceSdagDirectCallABIName;
+}
+
 unsigned spillStoreOpcode(const TargetRegisterClass *RC) {
   if (RC == &Brace::I8RegsRegClass)
     return Brace::SPILL_STORE8;
@@ -86,7 +91,7 @@ bool BraceInstrInfo::isReMaterializableImpl(const MachineInstr &MI) const {
     return TargetInstrInfo::isReMaterializableImpl(MI);
 
   const MachineFunction *MF = MI.getMF();
-  if (!MF || !usesSpillHomes(*MF) ||
+  if (!MF || !allowsPAddrRematerialization(*MF) ||
       MI.getNumOperands() != MI.getNumExplicitOperands() ||
       MI.getNumExplicitOperands() != 2 || !MI.getOperand(0).isReg() ||
       !MI.getOperand(0).isDef() || !MI.getOperand(1).isImm() ||

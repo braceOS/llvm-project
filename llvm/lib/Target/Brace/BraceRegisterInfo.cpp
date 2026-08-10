@@ -8,6 +8,7 @@
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/TargetSubtargetInfo.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Target/TargetMachine.h"
 
 #define GET_REGINFO_TARGET_DESC
 #include "BraceGenRegisterInfo.inc"
@@ -30,8 +31,13 @@ BitVector BraceRegisterInfo::getReservedRegs(const MachineFunction &) const {
   return BitVector(getNumRegs());
 }
 
-bool BraceRegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator, int,
+bool BraceRegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator MI, int,
                                             unsigned, RegScavenger *) const {
+  const MachineFunction *MF = MI->getMF();
+  if (MF && MF->getTarget().Options.MCOptions.getABIName() ==
+                BraceSdagDirectCallABIName)
+    report_fatal_error(
+        "brace64 S3b.5 call-live activation home is unsupported");
   report_fatal_error(
       "brace64 S3b.3 leaf ABI does not admit stack frame indices");
 }

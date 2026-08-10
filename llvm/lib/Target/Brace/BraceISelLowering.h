@@ -14,6 +14,8 @@ namespace BraceISD {
 enum NodeType : unsigned {
   FIRST_NUMBER = ISD::BUILTIN_OP_END,
   RET,
+  RET_VALUE,
+  CALL,
   BR_CC,
 };
 } // namespace BraceISD
@@ -28,6 +30,14 @@ public:
                                const SmallVectorImpl<ISD::InputArg> &Ins,
                                const SDLoc &DL, SelectionDAG &DAG,
                                SmallVectorImpl<SDValue> &InVals) const override;
+  SDValue LowerCall(TargetLowering::CallLoweringInfo &CLI,
+                    SmallVectorImpl<SDValue> &InVals) const override;
+  MVT getRegisterTypeForCallingConv(LLVMContext &Context,
+                                    CallingConv::ID CallConv,
+                                    EVT VT) const override;
+  unsigned getNumRegistersForCallingConv(LLVMContext &Context,
+                                         CallingConv::ID CallConv,
+                                         EVT VT) const override;
   bool CanLowerReturn(CallingConv::ID CallConv, MachineFunction &MF,
                       bool IsVarArg,
                       const SmallVectorImpl<ISD::OutputArg> &Outs,
@@ -38,6 +48,7 @@ public:
                       SelectionDAG &DAG) const override;
 
 private:
+  bool DirectCallABI;
   SDValue lowerBRCC(SDValue Op, SelectionDAG &DAG) const;
 };
 

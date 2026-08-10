@@ -1,0 +1,687 @@
+# REQUIRES: brace-registered-target
+#
+# Derive the two registered MIR seams from the positive input, mutate one
+# call/frame/liveness invariant at a time, and require fail-closed publication.
+# The final-seam case skips the post-RA pass on purpose and proves the object
+# final publication seam independently reconstructs definite initialization
+# across Call before any object bytes are emitted.
+#
+# DEFINE: %{brace-s3b5-llc} = llc -mtriple=brace64-unknown-none-elf \
+# DEFINE:   -target-abi=brace-system-s2-direct-call-r0 -O1 \
+# DEFINE:   -verify-machineinstrs -filetype=obj
+# RUN: rm -rf %t.dir && mkdir -p %t.dir
+# RUN: split-file %s %t.dir
+# RUN: %{brace-s3b5-llc} -stop-after=virtregrewriter \
+# RUN:   %S/s3b5-direct-call.ll -o %t.dir/postra.mir
+# RUN: %{brace-s3b5-llc} -stop-after=brace-finalize-branches \
+# RUN:   %S/s3b5-direct-call.ll -o %t.dir/final.mir
+#
+# The real call must retain the exact empty preserved mask and exact r4
+# implicit-def/result plus implicit-use/argument relationship.
+# RUN: sed 's/, csr_noregs//' %t.dir/postra.mir > %t.dir/no-mask.mir
+# RUN: not --crash %{brace-s3b5-llc} -start-after=virtregrewriter \
+# RUN:   %t.dir/no-mask.mir -o %t.dir/no-mask.o
+# RUN: test ! -s %t.dir/no-mask.o
+# RUN: sed 's/implicit-def $r4/implicit-def $r5/' \
+# RUN:   %t.dir/postra.mir > %t.dir/wrong-result.mir
+# RUN: not --crash %{brace-s3b5-llc} -start-after=virtregrewriter \
+# RUN:   %t.dir/wrong-result.mir -o %t.dir/wrong-result.o
+# RUN: test ! -s %t.dir/wrong-result.o
+# RUN: sed 's/implicit $r4/implicit $r5/' \
+# RUN:   %t.dir/postra.mir > %t.dir/wrong-argument.mir
+# RUN: not --crash %{brace-s3b5-llc} -start-after=virtregrewriter \
+# RUN:   %t.dir/wrong-argument.mir -o %t.dir/wrong-argument.o
+# RUN: test ! -s %t.dir/wrong-argument.o
+# RUN: sed 's/CALL_I32 @brace_system_call_leaf/CALL_I32 @brace_system_entry/' \
+# RUN:   %t.dir/postra.mir > %t.dir/wrong-target.mir
+# RUN: not --crash %{brace-s3b5-llc} -start-after=virtregrewriter \
+# RUN:   %t.dir/wrong-target.mir -o %t.dir/wrong-target.o
+# RUN: test ! -s %t.dir/wrong-target.o
+# RUN: awk '/CALL_I32 @brace_system_call_leaf/ { print; print; next } \
+# RUN:   { print }' %t.dir/postra.mir > %t.dir/second-call.mir
+# RUN: not --crash %{brace-s3b5-llc} -start-after=virtregrewriter \
+# RUN:   %t.dir/second-call.mir -o %t.dir/second-call.o
+# RUN: test ! -s %t.dir/second-call.o
+#
+# MachineFunction and entry-block live-ins are both part of the helper ABI.
+# RUN: sed "s/reg: '\$r4'/reg: '\$r5'/" \
+# RUN:   %t.dir/postra.mir > %t.dir/wrong-mf-livein.mir
+# RUN: not --crash %{brace-s3b5-llc} -start-after=virtregrewriter \
+# RUN:   %t.dir/wrong-mf-livein.mir -o %t.dir/wrong-mf-livein.o
+# RUN: test ! -s %t.dir/wrong-mf-livein.o
+# RUN: sed 's/liveins: $r4/liveins: $r5/' \
+# RUN:   %t.dir/postra.mir > %t.dir/wrong-block-livein.mir
+# RUN: not --crash %{brace-s3b5-llc} -start-after=virtregrewriter \
+# RUN:   %t.dir/wrong-block-livein.mir -o %t.dir/wrong-block-livein.o
+# RUN: test ! -s %t.dir/wrong-block-livein.o
+# RUN: sed 's/RET_I32 $r4/RET_I32 $r5/' \
+# RUN:   %t.dir/postra.mir > %t.dir/wrong-return.mir
+# RUN: not --crash %{brace-s3b5-llc} -start-after=virtregrewriter \
+# RUN:   %t.dir/wrong-return.mir -o %t.dir/wrong-return.o
+# RUN: test ! -s %t.dir/wrong-return.o
+#
+# Root and helper call state are asymmetric; stack/frame/return-address state
+# remains forbidden even though the root contains a semantic Call operation.
+# RUN: sed 's/hasCalls:        true/hasCalls:        false/' \
+# RUN:   %t.dir/postra.mir > %t.dir/root-no-call-state.mir
+# RUN: not --crash %{brace-s3b5-llc} -start-after=virtregrewriter \
+# RUN:   %t.dir/root-no-call-state.mir -o %t.dir/root-no-call-state.o
+# RUN: test ! -s %t.dir/root-no-call-state.o
+# RUN: sed 's/hasCalls:        false/hasCalls:        true/' \
+# RUN:   %t.dir/postra.mir > %t.dir/helper-call-state.mir
+# RUN: not --crash %{brace-s3b5-llc} -start-after=virtregrewriter \
+# RUN:   %t.dir/helper-call-state.mir -o %t.dir/helper-call-state.o
+# RUN: test ! -s %t.dir/helper-call-state.o
+# RUN: sed 's/isReturnAddressTaken: false/isReturnAddressTaken: true/' \
+# RUN:   %t.dir/postra.mir > %t.dir/return-address.mir
+# RUN: not --crash %{brace-s3b5-llc} -start-after=virtregrewriter \
+# RUN:   %t.dir/return-address.mir -o %t.dir/return-address.o
+# RUN: test ! -s %t.dir/return-address.o
+# RUN: awk 'BEGIN { done=0 } /^stack:           \[\]$/ && !done { \
+# RUN:   print "stack:"; \
+# RUN:   print "  - { id: 0, offset: -4, size: 4, alignment: 4 }"; \
+# RUN:   done=1; next } { print }' \
+# RUN:   %t.dir/postra.mir > %t.dir/stack-object.mir
+# RUN: not --crash %{brace-s3b5-llc} -start-after=virtregrewriter \
+# RUN:   %t.dir/stack-object.mir -o %t.dir/stack-object.o
+# RUN: test ! -s %t.dir/stack-object.o
+#
+# r0 is call-clobbered.  Keeping its pre-call definition alive and deleting
+# the required continuation rematerialization must fail independently of kill
+# flags.  At the final seam, a MachineVerifier-valid self-loop proves that the
+# AsmPrinter publication envelope independently rejects a direct-call function
+# with no Return.
+# RUN: sed -e 's/LOAD32 killed $r0/LOAD32 $r0/' \
+# RUN:   -e '/PADDR_IMM 2147483652/d' \
+# RUN:   %t.dir/postra.mir > %t.dir/caller-live-through.mir
+# RUN: not --crash %{brace-s3b5-llc} -start-after=virtregrewriter \
+# RUN:   %t.dir/caller-live-through.mir -o %t.dir/caller-live-through.o
+# RUN: test ! -s %t.dir/caller-live-through.o
+# RUN: awk 'BEGIN { root=0; body=0; changed=0 } \
+# RUN:   /^name:            brace_system_entry$/ { root=1 } \
+# RUN:   root && /^body:/ { body=1 } \
+# RUN:   root && body && /^  bb\.0\.entry:$/ { print; \
+# RUN:     print "    successors: %bb.0(0x80000000)"; next } \
+# RUN:   root && body && !changed && /^    RET$/ { \
+# RUN:     print "    BR %bb.0"; changed=1; next } \
+# RUN:   { print }' %t.dir/final.mir > %t.dir/final-no-return.mir
+# RUN: not --crash llc -mtriple=brace64-unknown-none-elf \
+# RUN:   -target-abi=brace-system-s2-direct-call-r0 -O1 -filetype=obj \
+# RUN:   -start-after=brace-finalize-branches \
+# RUN:   %t.dir/final-no-return.mir -o %t.dir/final-no-return.o 2>&1 | \
+# RUN:   FileCheck %s --check-prefix=WRITER
+# RUN: test ! -s %t.dir/final-no-return.o
+#
+# The target-owned table below adds real post-RA/final MIR seams for frame,
+# register, call/return, MachineFunction ordering, and writer intake failures.
+# Every row invokes llc, returns nonzero, and leaves zero object bytes.
+# STRUCTURAL-CASE-COUNT: 85
+# RUN: %python %t.dir/mir-contract-matrix.py %t.dir/postra.mir \
+# RUN:   %t.dir/final.mir %t.dir | FileCheck %s --check-prefix=MATRIX
+#
+# WRITER: brace64 S3b.5 post-RA verifier: function Call/Return profile is not exact
+# MATRIX: s3b5-mir-contract-matrix: 71/71 rejected with zero object bytes
+
+#--- mir-contract-matrix.py
+import pathlib
+import shutil
+import subprocess
+import sys
+
+postra_path = pathlib.Path(sys.argv[1])
+final_path = pathlib.Path(sys.argv[2])
+out = pathlib.Path(sys.argv[3]) / "mir-contract-matrix"
+out.mkdir(parents=True, exist_ok=True)
+llc = shutil.which("llc")
+if not llc:
+    raise SystemExit("llc is not on the lit PATH")
+postra = postra_path.read_text()
+final = final_path.read_text()
+
+def replace_once(text, old, new):
+    if text.count(old) != 1:
+        raise AssertionError("mutation source is not unique: " + old[:72])
+    return text.replace(old, new, 1)
+
+def replace_first(text, old, new):
+    if old not in text:
+        raise AssertionError("mutation source is missing: " + old[:72])
+    return text.replace(old, new, 1)
+
+def insert_before_first(text, needle, line):
+    return replace_once(text, needle, line + "\n" + needle)
+
+def mir_documents(text):
+    pieces = text.split("\n---\n")
+    if len(pieces) != 3:
+        raise AssertionError("expected module plus two MachineFunctions")
+    return pieces
+
+def replace_body(document, lines):
+    start = document.index("body:             |\n")
+    end = document.rindex("\n...")
+    return (document[:start] + "body:             |\n" +
+            "\n".join(lines) + document[end:])
+
+cases = []
+def case(name, seam, text, diagnostic="error"):
+    original = postra if seam == "postra" else final
+    if text == original:
+        raise AssertionError("no-op mutation: " + name)
+    cases.append((name, seam, text, diagnostic.lower()))
+
+case("wrong-named-call-mask", "postra",
+     replace_once(postra, "csr_noregs", "csr_badmask"),
+     "typed immediate operand")
+case("call-missing-result", "postra",
+     replace_once(postra, ", implicit-def $r4, implicit $r4",
+                  ", implicit $r4"),
+     "brace64")
+case("call-extra-explicit-operand", "postra",
+     replace_once(postra, "@brace_system_call_leaf, csr_noregs",
+                  "@brace_system_call_leaf, 0, csr_noregs"),
+     "brace64")
+case("valued-return-missing-value", "postra",
+     replace_once(postra, "RET_I32 $r4", "RET_I32"), "brace64")
+case("valued-return-extra-value", "postra",
+     replace_once(postra, "RET_I32 $r4", "RET_I32 $r4, $r5"), "brace64")
+case("root-live-out", "postra",
+     replace_once(postra, "    RET\n...", "    RET implicit $r5\n..."),
+     "brace64")
+
+home = insert_before_first(postra,
+                           "    CALL_I32 @brace_system_call_leaf",
+                           "    HOME_SAVE32 0, $r4")
+case("compiler-home", "postra", home, "brace64")
+
+frame_index = replace_first(
+    postra, "stack:           []",
+    "stack:\n"
+    "  - { id: 0, name: '', type: spill-slot, offset: 0, size: 4, "
+    "alignment: 4,\n"
+    "      stack-id: default, callee-saved-register: '', "
+    "callee-saved-restored: true,\n"
+    "      debug-info-variable: '', debug-info-expression: '', "
+    "debug-info-location: '' }")
+frame_index = insert_before_first(frame_index,
+                                  "    CALL_I32 @brace_system_call_leaf",
+                                  "    SPILL_STORE32 $r4, %stack.0 :: "
+                                  "(store (s32) into %stack.0)")
+case("frame-index", "postra", frame_index, "error")
+
+call_frame = insert_before_first(postra,
+                                 "    CALL_I32 @brace_system_call_leaf",
+                                 "    ADJCALLSTACKDOWN 0, 0")
+case("call-frame-pseudo", "postra", call_frame, "error")
+case("wrong-physical-register-class", "postra",
+     insert_before_first(postra, "    CALL_I32 @brace_system_call_leaf",
+                         "    $r0 = CONST32 0"),
+     "brace64")
+
+virtual = replace_first(
+    postra, "registers:       []",
+    "registers:\n  - { id: 0, class: i32regs, preferred-register: '', flags: [  ] }")
+virtual = replace_once(virtual, "$r4 = LOAD32 killed $r0",
+                       "%0:i32regs = LOAD32 killed $r0")
+case("virtual-register-after-rewrite", "postra", virtual, "error")
+case("register-r6", "postra",
+     replace_once(postra, "$r5 = LOAD32", "$r6 = LOAD32"),
+     "unknown register name")
+for name, register in [("stack-pointer", "$sp"),
+                       ("frame-pointer", "$fp"),
+                       ("return-address", "$ra")]:
+    case(name, "postra",
+         insert_before_first(postra,
+                             "    CALL_I32 @brace_system_call_leaf",
+                             "    " + register + " = COPY $r4"),
+         "unknown register name")
+
+callee_saved = replace_once(postra, "liveins:         []\nframeInfo:",
+                            "liveins:         []\ncalleeSavedRegisters: [ '$r4' ]\nframeInfo:")
+case("callee-saved-register", "postra", callee_saved, "brace64")
+case("frame-address-taken", "postra",
+     replace_first(postra, "isFrameAddressTaken: false",
+                  "isFrameAddressTaken: true"), "brace64")
+case("adjusts-stack", "postra",
+     replace_first(postra, "adjustsStack:    false", "adjustsStack:    true"),
+     "brace64")
+case("nonzero-call-frame", "postra",
+     replace_first(postra, "maxCallFrameSize: 4294967295",
+                  "maxCallFrameSize: 4"), "brace64")
+case("prologue-operation", "postra",
+     replace_once(postra, "$r0 = PADDR_IMM 2147483648",
+                  "$r0 = frame-setup PADDR_IMM 2147483648"),
+     "brace64")
+case("epilogue-operation", "postra",
+     replace_once(postra, "    RET\n...", "    frame-destroy RET\n..."),
+     "brace64")
+case("unknown-opcode", "postra",
+     insert_before_first(postra, "    CALL_I32 @brace_system_call_leaf",
+                         "    BRACE_UNKNOWN_OPCODE"),
+     "unknown machine instruction name")
+
+unresolved = replace_once(final, "@brace_system_call_leaf, csr_noregs",
+                          "@brace_missing_leaf, csr_noregs")
+case("unresolved-call-target", "final", unresolved, "use of undefined global")
+case("generic-call-symbol", "final",
+     replace_once(final, "CALL_I32 @brace_system_call_leaf",
+                  "CALL @brace_system_call_leaf"),
+     "unknown machine instruction name")
+case("branch-unresolved-block", "final",
+     replace_once(final, "    RET\n...", "    BR %bb.99\n..."),
+     "use of undefined machine basic block")
+
+module, root_doc, helper_doc = mir_documents(final)
+case("missing-helper-machine-function", "final",
+     module + "\n---\n" + root_doc, "error")
+case("duplicate-helper-machine-function", "final",
+     final + "\n---\n" + helper_doc, "error")
+case("duplicate-root-publication", "final",
+     final + "\n---\n" + root_doc, "error")
+case("out-of-order-machine-functions", "final",
+     module + "\n---\n" + helper_doc + "\n---\n" + root_doc,
+     "error")
+
+signature_drift = replace_once(
+    final,
+    "define internal fastcc i32 @brace_system_call_leaf(i32 noundef %value)",
+    "define internal fastcc i32 @brace_system_call_leaf(i8 noundef %value)")
+case("embedded-signature-drift", "final", signature_drift, "error")
+case("final-wrong-result-register", "final",
+     replace_once(final, "implicit-def $r4", "implicit-def $r5"),
+     "error")
+
+# These two accepted final-MIR seeds cover every DirectCall-publishable opcode
+# shape that the small canonical module does not naturally contain.  Each
+# negative row below is derived from an accepted seed by adding exactly one
+# implicit operand or one MachineInstr flag.
+eight_shape_helper = replace_body(helper_doc, [
+    "  bb.0.entry:",
+    "    successors: %bb.1(0x40000000), %bb.2(0x40000000)",
+    "",
+    "    $r0 = PADDR_IMM 268435461",
+    "    $r2 = LOAD8 killed $r0 :: (volatile load (s8) from "
+    "`ptr addrspace(200) inttoptr (i64 268435461 to ptr addrspace(200))`, "
+    "addrspace 200)",
+    "    $r3 = CONST8 32",
+    "    $r2 = AND8 killed $r2, killed $r3",
+    "    $r3 = MOV8 killed $r2",
+    "    BR_IF8 killed $r3, %bb.2, %bb.1",
+    "",
+    "  bb.1:",
+    "    successors: %bb.3(0x80000000)",
+    "",
+    "    $r0 = PADDR_IMM 2147483668",
+    "    $r2 = CONST8 -35",
+    "    STORE8 killed $r0, killed $r2 :: (volatile store (s8) into "
+    "`ptr addrspace(200) inttoptr (i64 2147483668 to ptr addrspace(200))`, "
+    "align 4, addrspace 200)",
+    "    BR %bb.3",
+    "",
+    "  bb.2:",
+    "    successors: %bb.3(0x80000000)",
+    "",
+    "    $r0 = PADDR_IMM 2147483668",
+    "    $r2 = LOAD8 killed $r0 :: (volatile load (s8) from "
+    "`ptr addrspace(200) inttoptr (i64 2147483668 to ptr addrspace(200))`, "
+    "align 4, addrspace 200)",
+    "",
+    "  bb.3:",
+    "    $r4 = CONST32 1",
+    "    RET_I32 $r4",
+])
+eight_shape = (module + "\n---\n" + root_doc + "\n---\n" +
+               eight_shape_helper)
+
+branch32_root = replace_body(root_doc, [
+    "  bb.0.entry:",
+    "    successors: %bb.1(0x40000000), %bb.2(0x40000000)",
+    "",
+    "    $r0 = PADDR_IMM 2147483648",
+    "    $r4 = LOAD32 killed $r0 :: (volatile load (s32) from "
+    "`ptr addrspace(200) inttoptr (i64 2147483648 to ptr addrspace(200))`, "
+    "align 2147483648, addrspace 200)",
+    "    CALL_I32 @brace_system_call_leaf, csr_noregs, "
+    "implicit-def $r4, implicit $r4",
+    "    $r5 = CONST32 0",
+    "    BR_IF32 killed $r5, %bb.1, %bb.2",
+    "",
+    "  bb.1:",
+    "    liveins: $r4",
+    "",
+    "    $r0 = PADDR_IMM 2147483652",
+    "    STORE32 killed $r0, killed $r4 :: (volatile store (s32) into "
+    "`ptr addrspace(200) inttoptr (i64 2147483652 to ptr addrspace(200))`, "
+    "addrspace 200)",
+    "    RET",
+    "",
+    "  bb.2:",
+    "    liveins: $r4",
+    "",
+    "    $r0 = PADDR_IMM 2147483652",
+    "    STORE32 killed $r0, killed $r4 :: (volatile store (s32) into "
+    "`ptr addrspace(200) inttoptr (i64 2147483652 to ptr addrspace(200))`, "
+    "addrspace 200)",
+    "    RET",
+])
+branch32_shape = (module + "\n---\n" + branch32_root + "\n---\n" +
+                  helper_doc)
+accepted_seeds = [("eight-shape", eight_shape),
+                  ("branch32-shape", branch32_shape)]
+
+# Final-MIR restarts skip the ordinary target pass.  Every published opcode
+# must therefore re-enter the same target-owned exact operand/flag envelope in
+# AsmPrinter.  Use one real instance of all 17 DirectCall-publishable opcodes;
+# CALL additionally proves that no extra implicit result can be normalized
+# away.
+implicit_mutations = [
+    ("call", ", implicit-def $r4, implicit $r4",
+     ", implicit-def $r4, implicit $r4, implicit-def $r5",
+     "call_i32 operand count is not canonical"),
+    ("paddr", "    $r0 = PADDR_IMM 2147483648",
+     "    $r0 = PADDR_IMM 2147483648, implicit-def $r5",
+     "implicit register, regmask, or live-out operands are forbidden"),
+    ("load", "$r4 = LOAD32 killed $r0 ::",
+     "$r4 = LOAD32 killed $r0, implicit-def $r5 ::",
+     "implicit register, regmask, or live-out operands are forbidden"),
+    ("store", "STORE32 killed $r0, killed $r4 ::",
+     "STORE32 killed $r0, killed $r4, implicit-def $r5 ::",
+     "implicit register, regmask, or live-out operands are forbidden"),
+    ("and", "$r5 = AND32 killed $r5, killed $r4",
+     "$r5 = AND32 killed $r5, killed $r4, implicit-def $r0",
+     "implicit register, regmask, or live-out operands are forbidden"),
+    ("mov", "$r4 = MOV32 killed $r5",
+     "$r4 = MOV32 killed $r5, implicit-def $r0",
+     "implicit register, regmask, or live-out operands are forbidden"),
+    ("ret", "    RET\n...", "    RET implicit-def $r5\n...",
+     "implicit register, regmask, or live-out operands are forbidden"),
+    ("ret-i32", "    RET_I32 $r4", "    RET_I32 $r4, implicit-def $r5",
+     "implicit register, regmask, or live-out operands are forbidden"),
+]
+missing_implicit_mutations = [
+    ("const8", eight_shape, "$r3 = CONST8 32",
+     "$r3 = CONST8 32, implicit-def $r5"),
+    ("const32", eight_shape, "$r4 = CONST32 1",
+     "$r4 = CONST32 1, implicit-def $r5"),
+    ("and8", eight_shape, "$r2 = AND8 killed $r2, killed $r3",
+     "$r2 = AND8 killed $r2, killed $r3, implicit-def $r5"),
+    ("mov8", eight_shape, "$r3 = MOV8 killed $r2",
+     "$r3 = MOV8 killed $r2, implicit-def $r5"),
+    ("load8", eight_shape,
+     "$r2 = LOAD8 killed $r0 :: (volatile load (s8) from "
+     "`ptr addrspace(200) inttoptr (i64 268435461",
+     "$r2 = LOAD8 killed $r0, implicit-def $r5 :: (volatile load (s8) from "
+     "`ptr addrspace(200) inttoptr (i64 268435461"),
+    ("store8", eight_shape, "STORE8 killed $r0, killed $r2 ::",
+     "STORE8 killed $r0, killed $r2, implicit-def $r5 ::"),
+    ("br", eight_shape, "    BR %bb.3",
+     "    BR %bb.3, implicit-def $r5"),
+    ("br-if8", eight_shape, "BR_IF8 killed $r3, %bb.2, %bb.1",
+     "BR_IF8 killed $r3, %bb.2, %bb.1, implicit-def $r5"),
+    ("br-if32", branch32_shape, "BR_IF32 killed $r5, %bb.1, %bb.2",
+     "BR_IF32 killed $r5, %bb.1, %bb.2, implicit-def $r0"),
+]
+for opcode_name, old, new, diagnostic in implicit_mutations:
+    case("final-%s-extra-implicit" % opcode_name, "final",
+         replace_once(final, old, new), diagnostic)
+for opcode_name, seed, old, new in missing_implicit_mutations:
+    case("final-%s-extra-implicit" % opcode_name, "final",
+         replace_once(seed, old, new),
+         "implicit register, regmask, or live-out operands are forbidden")
+
+flag_mutations = [
+    ("call", "    CALL_I32 @brace_system_call_leaf",
+     "    frame-setup CALL_I32 @brace_system_call_leaf",
+     "call_i32 carries unconsumed publication metadata"),
+    ("load", "    $r4 = LOAD32 killed $r0 ::",
+     "    $r4 = frame-setup LOAD32 killed $r0 ::",
+     "unconsumed machineinstr publication metadata is forbidden"),
+    ("store", "    STORE32 killed $r0, killed $r4 ::",
+     "    frame-setup STORE32 killed $r0, killed $r4 ::",
+     "unconsumed machineinstr publication metadata is forbidden"),
+    ("and", "    $r5 = AND32 killed $r5, killed $r4",
+     "    $r5 = frame-setup AND32 killed $r5, killed $r4",
+     "unconsumed machineinstr publication metadata is forbidden"),
+    ("mov", "    $r4 = MOV32 killed $r5",
+     "    $r4 = frame-setup MOV32 killed $r5",
+     "unconsumed machineinstr publication metadata is forbidden"),
+    ("ret", "    RET\n...", "    frame-destroy RET\n...",
+     "unconsumed machineinstr publication metadata is forbidden"),
+    ("ret-i32", "    RET_I32 $r4", "    frame-destroy RET_I32 $r4",
+     "unconsumed machineinstr publication metadata is forbidden"),
+]
+for opcode_name, old, new, diagnostic in flag_mutations:
+    case("final-%s-instruction-flag" % opcode_name, "final",
+         replace_once(final, old, new), diagnostic)
+
+paddr_flagged = final.replace(" = PADDR_IMM", " = frame-setup PADDR_IMM")
+case("final-paddr-instruction-flags", "final", paddr_flagged,
+     "unconsumed machineinstr publication metadata is forbidden")
+
+missing_flag_mutations = [
+    ("const8", eight_shape, "$r3 = CONST8 32",
+     "$r3 = frame-setup CONST8 32"),
+    ("const32", eight_shape, "$r4 = CONST32 1",
+     "$r4 = frame-setup CONST32 1"),
+    ("and8", eight_shape, "$r2 = AND8 killed $r2, killed $r3",
+     "$r2 = frame-setup AND8 killed $r2, killed $r3"),
+    ("mov8", eight_shape, "$r3 = MOV8 killed $r2",
+     "$r3 = frame-setup MOV8 killed $r2"),
+    ("load8", eight_shape,
+     "$r2 = LOAD8 killed $r0 :: (volatile load (s8) from "
+     "`ptr addrspace(200) inttoptr (i64 268435461",
+     "$r2 = frame-setup LOAD8 killed $r0 :: (volatile load (s8) from "
+     "`ptr addrspace(200) inttoptr (i64 268435461"),
+    ("store8", eight_shape, "    STORE8 killed $r0, killed $r2 ::",
+     "    frame-setup STORE8 killed $r0, killed $r2 ::"),
+    ("br", eight_shape, "    BR %bb.3",
+     "    frame-setup BR %bb.3"),
+    ("br-if8", eight_shape, "    BR_IF8 killed $r3, %bb.2, %bb.1",
+     "    frame-setup BR_IF8 killed $r3, %bb.2, %bb.1"),
+    ("br-if32", branch32_shape,
+     "    BR_IF32 killed $r5, %bb.1, %bb.2",
+     "    frame-setup BR_IF32 killed $r5, %bb.1, %bb.2"),
+]
+for opcode_name, seed, old, new in missing_flag_mutations:
+    case("final-%s-instruction-flag" % opcode_name, "final",
+         replace_once(seed, old, new),
+         "unconsumed machineinstr publication metadata is forbidden")
+
+result_unused = replace_once(
+    final,
+    "    $r0 = PADDR_IMM 2147483652\n"
+    "    STORE32 killed $r0, killed $r4",
+    "    $r5 = CONST32 0\n"
+    "    $r0 = PADDR_IMM 2147483652\n"
+    "    STORE32 killed $r0, killed $r5")
+case("final-result-unused", "final", result_unused,
+     "direct-call result is not consumed on every root exit path")
+
+result_overwritten = replace_once(
+    final,
+    "    $r0 = PADDR_IMM 2147483652",
+    "    $r5 = CONST32 0\n"
+    "    $r4 = MOV32 killed $r5\n"
+    "    $r0 = PADDR_IMM 2147483652")
+case("final-result-overwritten-then-read", "final", result_overwritten,
+     "direct-call result is overwritten before consumption")
+
+partial_root = replace_body(root_doc, [
+    "  bb.0.entry:",
+    "    successors: %bb.1(0x40000000), %bb.2(0x40000000)",
+    "",
+    "    $r0 = PADDR_IMM 2147483648",
+    "    $r4 = LOAD32 killed $r0 :: (volatile load (s32) from "
+    "`ptr addrspace(200) inttoptr (i64 2147483648 to ptr addrspace(200))`, "
+    "align 2147483648, addrspace 200)",
+    "    CALL_I32 @brace_system_call_leaf, csr_noregs, "
+    "implicit-def $r4, implicit $r4",
+    "    $r5 = CONST32 0",
+    "    BR_IF32 killed $r5, %bb.1, %bb.2",
+    "",
+    "  bb.1:",
+    "    liveins: $r4",
+    "",
+    "    $r0 = PADDR_IMM 2147483652",
+    "    STORE32 killed $r0, killed $r4 :: (volatile store (s32) into "
+    "`ptr addrspace(200) inttoptr (i64 2147483652 to ptr addrspace(200))`, "
+    "addrspace 200)",
+    "    RET",
+    "",
+    "  bb.2:",
+    "    RET",
+])
+partial_result = (module + "\n---\n" + partial_root + "\n---\n" +
+                  helper_doc)
+case("final-result-consumed-on-one-exit", "final", partial_result,
+     "direct-call result is not consumed on every root exit path")
+
+extra_stores = "".join(
+    "    $r0 = PADDR_IMM 2147483652\n"
+    "    STORE32 $r0, $r4 :: (volatile store (s32) into "
+    "`ptr addrspace(200) inttoptr (i64 2147483652 to ptr addrspace(200))`, "
+    "addrspace 200)\n"
+    for _ in range(31))
+memory_plus = replace_once(
+    final,
+    "    $r0 = PADDR_IMM 2147483652\n"
+    "    STORE32 killed $r0, killed $r4",
+    extra_stores +
+    "    $r0 = PADDR_IMM 2147483652\n"
+    "    STORE32 killed $r0, killed $r4")
+memory_plus = replace_once(memory_plus, "    RET_I32 $r4",
+                           extra_stores + "    RET_I32 $r4")
+case("final-module-memory-plus", "final", memory_plus,
+     "direct-call module physical memory operation limit exceeded")
+
+five_block_root = replace_body(root_doc, [
+    "  bb.0.entry:",
+    "    successors: %bb.1(0x80000000)",
+    "",
+    "    $r0 = PADDR_IMM 2147483648",
+    "    $r4 = LOAD32 killed $r0 :: (volatile load (s32) from "
+    "`ptr addrspace(200) inttoptr (i64 2147483648 to ptr addrspace(200))`, "
+    "align 2147483648, addrspace 200)",
+    "    CALL_I32 @brace_system_call_leaf, csr_noregs, "
+    "implicit-def $r4, implicit $r4",
+    "    BR %bb.1",
+    "",
+    "  bb.1:",
+    "    successors: %bb.2(0x80000000)",
+    "    liveins: $r4",
+    "",
+    "    $r0 = PADDR_IMM 2147483652",
+    "    BR %bb.2",
+    "",
+    "  bb.2:",
+    "    successors: %bb.3(0x80000000)",
+    "    liveins: $r0, $r4",
+    "",
+    "    STORE32 killed $r0, killed $r4 :: (volatile store (s32) into "
+    "`ptr addrspace(200) inttoptr (i64 2147483652 to ptr addrspace(200))`, "
+    "addrspace 200)",
+    "    BR %bb.3",
+    "",
+    "  bb.3:",
+    "    successors: %bb.4(0x80000000)",
+    "",
+    "    BR %bb.4",
+    "",
+    "  bb.4:",
+    "    RET",
+])
+five_blocks = (module + "\n---\n" + five_block_root + "\n---\n" +
+               helper_doc)
+case("final-function-block-plus", "final", five_blocks,
+     "machine basic-block count is outside 1..4")
+
+five_fallthrough_root = replace_body(root_doc, [
+    "  bb.0.entry:",
+    "    successors: %bb.1(0x80000000)",
+    "",
+    "    $r0 = PADDR_IMM 2147483648",
+    "    $r4 = LOAD32 killed $r0 :: (volatile load (s32) from "
+    "`ptr addrspace(200) inttoptr (i64 2147483648 to ptr addrspace(200))`, "
+    "align 2147483648, addrspace 200)",
+    "    CALL_I32 @brace_system_call_leaf, csr_noregs, "
+    "implicit-def $r4, implicit $r4",
+    "",
+    "  bb.1:",
+    "    successors: %bb.2(0x80000000)",
+    "    liveins: $r4",
+    "",
+    "    $r0 = PADDR_IMM 2147483652",
+    "    STORE32 killed $r0, killed $r4 :: (volatile store (s32) into "
+    "`ptr addrspace(200) inttoptr (i64 2147483652 to ptr addrspace(200))`, "
+    "addrspace 200)",
+    "",
+    "  bb.2:",
+    "    successors: %bb.3(0x80000000)",
+    "",
+    "    $r5 = CONST32 1",
+    "",
+    "  bb.3:",
+    "    successors: %bb.4(0x80000000)",
+    "",
+    "    $r5 = CONST32 2",
+    "",
+    "  bb.4:",
+    "    RET",
+])
+five_fallthrough = (module + "\n---\n" + five_fallthrough_root +
+                    "\n---\n" + helper_doc)
+case("final-function-fallthrough-block-plus", "final", five_fallthrough,
+     "machine basic-block count is outside 1..4")
+
+base_args = [
+    llc,
+    "-mtriple=brace64-unknown-none-elf",
+    "-target-abi=brace-system-s2-direct-call-r0",
+    "-O1",
+    "-verify-machineinstrs",
+    "-filetype=obj",
+]
+failures = []
+for seed_name, contents in accepted_seeds:
+    source = out / ("seed-%s.mir" % seed_name)
+    obj = out / ("seed-%s.o" % seed_name)
+    source.write_text(contents)
+    obj.unlink(missing_ok=True)
+    completed = subprocess.run(
+        base_args + ["-start-after=brace-finalize-branches", str(source),
+                     "-o", str(obj)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=30)
+    if completed.returncode != 0 or not obj.exists() or obj.stat().st_size == 0:
+        failures.append(seed_name + ": accepted opcode seed failed:\n" +
+                        completed.stdout)
+
+for index, (name, seam, contents, diagnostic) in enumerate(cases):
+    source = out / ("%02d-%s.mir" % (index, name))
+    obj = out / ("%02d-%s.o" % (index, name))
+    source.write_text(contents)
+    obj.unlink(missing_ok=True)
+    start = ("-start-after=virtregrewriter" if seam == "postra" else
+             "-start-after=brace-finalize-branches")
+    completed = subprocess.run(base_args + [start, str(source), "-o", str(obj)],
+                               stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT,
+                               text=True,
+                               timeout=30)
+    if completed.returncode == 0:
+        failures.append(name + ": unexpectedly accepted")
+        continue
+    if obj.exists() and obj.stat().st_size != 0:
+        failures.append(name + ": published object bytes")
+        continue
+    if diagnostic not in completed.stdout.lower():
+        failures.append(name + ": missing diagnostic %r:\n%s" %
+                        (diagnostic, completed.stdout))
+
+if failures:
+    raise AssertionError("\n\n".join(failures))
+
+print("s3b5-mir-contract-matrix: %d/%d rejected with zero object bytes" %
+      (len(cases), len(cases)))

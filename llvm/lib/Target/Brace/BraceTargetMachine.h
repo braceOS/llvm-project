@@ -19,7 +19,7 @@ class TargetLoweringObjectFile;
 
 class BraceTargetMachine final : public CodeGenTargetMachineImpl {
 public:
-  enum class SdagABIKind { None, Leaf, LeafHome };
+  enum class SdagABIKind { None, Leaf, LeafHome, DirectCall };
 
 private:
   BraceSubtarget Subtarget;
@@ -57,6 +57,9 @@ public:
   bool usesSdagABI() const { return SdagABI != SdagABIKind::None; }
   bool usesSdagLeafABI() const { return SdagABI == SdagABIKind::Leaf; }
   bool usesSdagLeafHomeABI() const { return SdagABI == SdagABIKind::LeafHome; }
+  bool usesSdagDirectCallABI() const {
+    return SdagABI == SdagABIKind::DirectCall;
+  }
   StringRef getSdagABIName() const;
   bool isMachineVerifierClean() const override { return true; }
 };

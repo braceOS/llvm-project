@@ -21,6 +21,7 @@
 #include "llvm/Support/MathExtras.h"
 #include <algorithm>
 #include <array>
+#include <limits>
 #include <optional>
 #include <string>
 
@@ -32,6 +33,10 @@ namespace {
 
 [[noreturn]] void reject(const Twine &Message) {
   report_fatal_error("brace64 S3b.3 post-RA verifier: " + Message);
+}
+
+[[noreturn]] void rejectDirect(const Twine &Message) {
+  report_fatal_error("brace64 S3b.5 post-RA verifier: " + Message);
 }
 
 bool isInteger8(Register Reg) { return Brace::I8RegsRegClass.contains(Reg); }
@@ -89,8 +94,48 @@ void verifyInstructionEnvelope(const MachineInstr &MI) {
     verifyOperandEnvelope(Operand);
 }
 
-void verifyBlockEnvelope(const MachineBasicBlock &MBB) {
-  if ((MBB.isEntryBlock() && !MBB.livein_empty()) ||
+void verifyDirectCallEnvelope(const MachineInstr &MI) {
+  if (MI.getOpcode() != Brace::CALL_I32 || MI.getNumOperands() != 4 ||
+      MI.getNumExplicitOperands() != 2)
+    rejectDirect("CALL_I32 operand count is not canonical");
+  if (MI.getFlags() != MachineInstr::NoFlags || MI.getAsmPrinterFlags() != 0 ||
+      MI.getDebugLoc() || MI.getPreInstrSymbol() || MI.getPostInstrSymbol() ||
+      MI.getHeapAllocMarker() || MI.getPCSections() || MI.getMMRAMetadata() ||
+      MI.getDeactivationSymbol() || MI.getCFIType() != 0 ||
+      !MI.memoperands_empty())
+    rejectDirect("CALL_I32 carries unconsumed publication metadata");
+
+  const MachineOperand &Target = MI.getOperand(0);
+  const MachineOperand &Mask = MI.getOperand(1);
+  const MachineOperand &Result = MI.getOperand(2);
+  const MachineOperand &Argument = MI.getOperand(3);
+  if (!Target.isGlobal() || Target.getTargetFlags() != 0 ||
+      Target.getOffset() != 0 ||
+      Target.getGlobal()->getName() != "brace_system_call_leaf")
+    rejectDirect("CALL_I32 target is not the exact private leaf");
+  const MachineFunction *MF = MI.getMF();
+  const TargetRegisterInfo *TRI =
+      MF ? MF->getSubtarget().getRegisterInfo() : nullptr;
+  const uint32_t *ExpectedMask =
+      TRI ? TRI->getCallPreservedMask(*MF, CallingConv::Fast) : nullptr;
+  if (!Mask.isRegMask() || !ExpectedMask || Mask.getRegMask() != ExpectedMask)
+    rejectDirect("CALL_I32 does not carry the exact empty preserved mask");
+  for (Register Reg :
+       {Brace::R0, Brace::R1, Brace::R2, Brace::R3, Brace::R4, Brace::R5})
+    if (!Mask.clobbersPhysReg(Reg))
+      rejectDirect("CALL_I32 mask preserves an admitted physical register");
+  if (!Result.isReg() || !Result.isImplicit() || !Result.isDef() ||
+      Result.getReg() != Brace::R4 || Result.readsReg() || !Argument.isReg() ||
+      !Argument.isImplicit() || Argument.isDef() || !Argument.readsReg() ||
+      Argument.getReg() != Brace::R4)
+    rejectDirect("CALL_I32 argument/result relationship is not exact r4");
+  verifyOperandEnvelope(Result);
+  verifyOperandEnvelope(Argument);
+}
+
+void verifyBlockEnvelope(const MachineBasicBlock &MBB,
+                         bool AllowsEntryLiveIn = false) {
+  if ((MBB.isEntryBlock() && !AllowsEntryLiveIn && !MBB.livein_empty()) ||
       MBB.getCallFrameSize() != 0 || MBB.getAlignment() != Align(1) ||
       MBB.getMaxBytesForAlignment() != 0 || MBB.isEHPad() ||
       MBB.hasAddressTaken() || MBB.hasLabelMustBeEmitted() ||
@@ -158,8 +203,12 @@ void finalizeConditionalBranch(MachineBasicBlock &MBB,
     TrailingBranch->eraseFromParent();
 }
 
-void verifyInstruction(const MachineInstr &MI, bool AllowsHomes) {
-  verifyInstructionEnvelope(MI);
+void verifyInstruction(const MachineInstr &MI, bool AllowsHomes,
+                       bool DirectCall = false) {
+  if (DirectCall && MI.getOpcode() == Brace::CALL_I32)
+    verifyDirectCallEnvelope(MI);
+  else
+    verifyInstructionEnvelope(MI);
 
   auto requireReg = [&](unsigned Index, bool (*Predicate)(Register), bool IsDef,
                         bool IsTied = false) {
@@ -322,6 +371,19 @@ void verifyInstruction(const MachineInstr &MI, bool AllowsHomes) {
   case Brace::RET:
     requireCount(0);
     break;
+  case Brace::CALL_I32:
+    if (!DirectCall)
+      reject("call is outside the leaf ABI");
+    // The exceptional implicit/register-mask envelope was checked above.
+    break;
+  case Brace::RET_I32:
+    if (!DirectCall)
+      reject("valued Return is outside the leaf ABI");
+    requireCount(1);
+    requireReg(0, isInteger32, /*IsDef=*/false);
+    if (MI.getOperand(0).getReg() != Brace::R4)
+      rejectDirect("RET_I32 must return the exact r4 result");
+    break;
   default:
     reject("unknown or pre-publication MachineInstr survived");
   }
@@ -370,44 +432,54 @@ uint8_t registerBit(Register Reg) {
   return static_cast<uint8_t>(1U << registerIndex(Reg));
 }
 
-uint8_t blockDefinitionMask(const MachineBasicBlock &MBB) {
-  uint8_t Mask = 0;
-  for (const MachineInstr &MI : MBB)
-    for (const MachineOperand &Operand : MI.operands())
-      if (Operand.isReg() && Operand.isDef())
-        Mask |= registerBit(Operand.getReg());
-  return Mask;
-}
-
-uint8_t blockUpwardUseMask(const MachineBasicBlock &MBB) {
-  uint8_t Defined = 0;
-  uint8_t UsedBeforeDefinition = 0;
+uint8_t transferRegisterDefinitions(const MachineBasicBlock &MBB, uint8_t State,
+                                    bool DirectCall) {
   for (const MachineInstr &MI : MBB) {
-    // Reads must be observed before defs so a tied two-address instruction
-    // cannot manufacture its own incoming value.
-    for (const MachineOperand &Operand : MI.operands()) {
-      if (!Operand.isReg() || !Operand.readsReg())
-        continue;
-      const uint8_t Bit = registerBit(Operand.getReg());
-      if ((Defined & Bit) == 0)
-        UsedBeforeDefinition |= Bit;
+    if (DirectCall && MI.getOpcode() == Brace::CALL_I32) {
+      State = registerBit(Brace::R4);
+      continue;
     }
     for (const MachineOperand &Operand : MI.operands())
       if (Operand.isReg() && Operand.isDef())
-        Defined |= registerBit(Operand.getReg());
+        State |= registerBit(Operand.getReg());
   }
-  return UsedBeforeDefinition;
+  return State;
 }
 
-void verifyRegisterDefinitions(MachineFunction &MF) {
+uint8_t transferRegisterLiveness(const MachineBasicBlock &MBB, uint8_t State,
+                                 bool DirectCall) {
+  for (auto I = MBB.rbegin(); I != MBB.rend(); ++I) {
+    const MachineInstr &MI = *I;
+    if (DirectCall && MI.getOpcode() == Brace::CALL_I32) {
+      // Every admitted register is clobbered; only the argument is read before
+      // that transfer.  The returned r4 is a new definition after the call.
+      State = 0;
+      for (const MachineOperand &Operand : MI.operands())
+        if (Operand.isReg() && Operand.readsReg())
+          State |= registerBit(Operand.getReg());
+      continue;
+    }
+    for (const MachineOperand &Operand : MI.operands())
+      if (Operand.isReg() && Operand.isDef())
+        State &= static_cast<uint8_t>(~registerBit(Operand.getReg()));
+    for (const MachineOperand &Operand : MI.operands())
+      if (Operand.isReg() && Operand.readsReg())
+        State |= registerBit(Operand.getReg());
+  }
+  return State;
+}
+
+void verifyRegisterDefinitions(MachineFunction &MF, uint8_t EntryDefinitions,
+                               bool DirectCall) {
   constexpr uint8_t AllRegisters = UINT8_C(0x3f);
   DenseMap<const MachineBasicBlock *, uint8_t> In;
   DenseMap<const MachineBasicBlock *, uint8_t> Out;
 
   for (const MachineBasicBlock &MBB : MF) {
-    const uint8_t Initial = &MBB == &MF.front() ? 0 : AllRegisters;
+    const uint8_t Initial =
+        &MBB == &MF.front() ? EntryDefinitions : AllRegisters;
     In[&MBB] = Initial;
-    Out[&MBB] = Initial | blockDefinitionMask(MBB);
+    Out[&MBB] = transferRegisterDefinitions(MBB, Initial, DirectCall);
   }
 
   bool Changed = true;
@@ -417,7 +489,7 @@ void verifyRegisterDefinitions(MachineFunction &MF) {
       reject("physical-register definition analysis did not converge");
     Changed = false;
     for (const MachineBasicBlock &MBB : MF) {
-      uint8_t NewIn = 0;
+      uint8_t NewIn = EntryDefinitions;
       if (&MBB != &MF.front()) {
         NewIn = AllRegisters;
         bool HasPredecessor = false;
@@ -428,7 +500,8 @@ void verifyRegisterDefinitions(MachineFunction &MF) {
         if (!HasPredecessor)
           reject("non-entry block has no predecessor");
       }
-      const uint8_t NewOut = NewIn | blockDefinitionMask(MBB);
+      const uint8_t NewOut =
+          transferRegisterDefinitions(MBB, NewIn, DirectCall);
       if (In[&MBB] != NewIn || Out[&MBB] != NewOut) {
         In[&MBB] = NewIn;
         Out[&MBB] = NewOut;
@@ -452,9 +525,7 @@ void verifyRegisterDefinitions(MachineFunction &MF) {
       uint8_t NewOut = 0;
       for (const MachineBasicBlock *Successor : MBB.successors())
         NewOut |= LiveIn[Successor];
-      const uint8_t NewIn =
-          blockUpwardUseMask(MBB) |
-          (NewOut & static_cast<uint8_t>(~blockDefinitionMask(MBB)));
+      const uint8_t NewIn = transferRegisterLiveness(MBB, NewOut, DirectCall);
       if (LiveIn[&MBB] != NewIn || LiveOut[&MBB] != NewOut) {
         LiveIn[&MBB] = NewIn;
         LiveOut[&MBB] = NewOut;
@@ -473,6 +544,10 @@ void verifyRegisterDefinitions(MachineFunction &MF) {
         if ((State & Bit) == 0)
           reject(
               "physical register is read without a definition on every path");
+      }
+      if (DirectCall && MI.getOpcode() == Brace::CALL_I32) {
+        State = registerBit(Brace::R4);
+        continue;
       }
       for (const MachineOperand &Operand : MI.operands()) {
         if (!Operand.isReg() || !Operand.isDef())
@@ -612,16 +687,22 @@ void verifyHomeDefinitions(MachineFunction &MF) {
       reject("every published semantic home requires both save and restore");
 }
 
-void transferPAddrDefinitions(const MachineBasicBlock &MBB, PAddrState &State) {
+void transferPAddrDefinitions(const MachineBasicBlock &MBB, PAddrState &State,
+                              bool DirectCall) {
   if (!State.Reachable)
     return;
-  for (const MachineInstr &MI : MBB)
+  for (const MachineInstr &MI : MBB) {
+    if (DirectCall && MI.getOpcode() == Brace::CALL_I32) {
+      State.Values = {};
+      continue;
+    }
     if (MI.getOpcode() == Brace::PADDR_IMM)
       State.Values[paddrIndex(MI.getOperand(0).getReg())] =
           static_cast<uint64_t>(MI.getOperand(1).getImm());
+  }
 }
 
-void verifyPAddrReachingDefinitions(MachineFunction &MF) {
+void verifyPAddrReachingDefinitions(MachineFunction &MF, bool DirectCall) {
   DenseMap<const MachineBasicBlock *, PAddrState> In;
   DenseMap<const MachineBasicBlock *, PAddrState> Out;
 
@@ -656,7 +737,7 @@ void verifyPAddrReachingDefinitions(MachineFunction &MF) {
       }
 
       PAddrState NewOut = NewIn;
-      transferPAddrDefinitions(MBB, NewOut);
+      transferPAddrDefinitions(MBB, NewOut, DirectCall);
       if (!(In[&MBB] == NewIn) || !(Out[&MBB] == NewOut)) {
         In[&MBB] = NewIn;
         Out[&MBB] = NewOut;
@@ -670,6 +751,10 @@ void verifyPAddrReachingDefinitions(MachineFunction &MF) {
     if (!State.Reachable)
       reject("machine block has no physical-address entry state");
     for (const MachineInstr &MI : MBB) {
+      if (DirectCall && MI.getOpcode() == Brace::CALL_I32) {
+        State.Values = {};
+        continue;
+      }
       if (MI.getOpcode() == Brace::PADDR_IMM) {
         State.Values[paddrIndex(MI.getOperand(0).getReg())] =
             static_cast<uint64_t>(MI.getOperand(1).getImm());
@@ -697,8 +782,193 @@ void verifyPAddrReachingDefinitions(MachineFunction &MF) {
   }
 }
 
+void verifyMachineFunctionEnvelope(MachineFunction &MF, bool AllowsHomes,
+                                   bool DirectCall) {
+  const bool IsEntry = MF.getName() == "brace_system_entry";
+  const bool IsHelper = MF.getName() == "brace_system_call_leaf";
+  if ((!DirectCall && !IsEntry) || (DirectCall && !IsEntry && !IsHelper))
+    DirectCall ? rejectDirect("unexpected MachineFunction identity")
+               : reject("unexpected MachineFunction identity");
+
+  const MachineFunctionProperties &Properties = MF.getProperties();
+  if (MF.getAlignment() != Align(1) || MF.exposesReturnsTwice() ||
+      MF.hasInlineAsm() || MF.hasWinCFI() || MF.callsEHReturn() ||
+      MF.callsUnwindInit() || MF.hasEHContTarget() || MF.hasEHScopes() ||
+      MF.hasEHFunclets() || MF.hasFakeUses() || MF.isOutlined() ||
+      MF.useDebugInstrRef() || MF.hasDebugValueSubstitutions() ||
+      MF.hasDebugPHIPositions() || !MF.getVariableDbgInfo().empty() ||
+      !MF.getCallSitesInfo().empty() || !MF.getCalledGlobals().empty() ||
+      !MF.getLongjmpTargets().empty() || !MF.getEHContTargets().empty() ||
+      !MF.getLandingPads().empty() || MF.hasAnyCallSiteLandingPad() ||
+      MF.hasAnyCallSiteLabel() || !MF.getCodeViewAnnotations().empty() ||
+      !MF.getTypeInfos().empty() || !MF.getFilterIds().empty() ||
+      MF.getWasmEHFuncInfo() || MF.getWinEHFuncInfo() ||
+      (MF.getJumpTableInfo() && !MF.getJumpTableInfo()->isEmpty()) ||
+      (MF.getConstantPool() && !MF.getConstantPool()->isEmpty()) ||
+      Properties.hasFailedISel() || Properties.hasLegalized() ||
+      Properties.hasRegBankSelected() || Properties.hasSelected() ||
+      Properties.hasFailsVerification() || Properties.hasFailedRegAlloc())
+    reject("MachineFunction state is outside the finite leaf envelope");
+
+  const MachineFrameInfo &Frame = MF.getFrameInfo();
+  if (Frame.getStackSize() != 0 || Frame.getNumFixedObjects() != 0 ||
+      Frame.hasVarSizedObjects() || Frame.hasStackProtectorIndex() ||
+      Frame.hasFunctionContextIndex() || Frame.getOffsetAdjustment() != 0 ||
+      Frame.getMaxCallFrameSize() != 0 ||
+      Frame.getCVBytesOfCalleeSavedRegisters() != 0 ||
+      !Frame.getCalleeSavedInfo().empty() ||
+      Frame.getLocalFrameObjectCount() != 0 ||
+      Frame.getLocalFrameSize() != 0 ||
+      Frame.getLocalFrameMaxAlign() != Align(1) ||
+      Frame.getUseLocalStackAllocationBlock() ||
+      !Frame.getSavePoints().empty() || !Frame.getRestorePoints().empty() ||
+      Frame.getUnsafeStackSize() != 0 ||
+      Frame.hasCalls() != (DirectCall && IsEntry) ||
+      Frame.isFrameAddressTaken() || Frame.isReturnAddressTaken() ||
+      Frame.hasStackMap() || Frame.hasPatchPoint() || Frame.adjustsStack() ||
+      Frame.hasOpaqueSPAdjustment() || Frame.hasVAStart() ||
+      Frame.hasCopyImplyingStackAdjustment() ||
+      Frame.hasMustTailInVarArgFunc() || Frame.hasTailCall())
+    reject("stack, frame, return-address, and call state are forbidden");
+  if (!AllowsHomes &&
+      (Frame.getNumObjects() != 0 || Frame.getMaxAlign() != Align(1)))
+    reject("S3b.3 leaf publication requires an exact empty frame");
+  if (AllowsHomes) {
+    if (Frame.getMaxAlign() > Align(4))
+      reject("spill-home frame metadata exceeds i32 alignment");
+    for (int FI = Frame.getObjectIndexBegin(); FI != Frame.getObjectIndexEnd();
+         ++FI)
+      if (!Frame.isDeadObjectIndex(FI) || !Frame.isSpillSlotObjectIndex(FI) ||
+          Frame.getObjectAllocation(FI) || Frame.isAliasedObjectIndex(FI) ||
+          Frame.getStackID(FI) != TargetStackID::Default)
+        reject("non-dead or non-spill frame object survived S3b.4");
+  }
+
+  const MachineRegisterInfo &MRI = MF.getRegInfo();
+  const MCPhysReg *CalleeSaved = MRI.getCalleeSavedRegs();
+  const bool ExactHelperLiveIn = IsHelper && MRI.liveins().size() == 1 &&
+                                 MRI.liveins()[0].first == Brace::R4 &&
+                                 !MRI.liveins()[0].second;
+  if (!MRI.tracksLiveness() ||
+      (IsHelper ? !ExactHelperLiveIn : !MRI.livein_empty()) ||
+      MRI.getNumVirtRegs() != 0 || (CalleeSaved && *CalleeSaved != 0) ||
+      !MF.getProperties().hasNoVRegs())
+    reject("live-in or virtual-register state survived physical rewrite");
+  if (MF.size() == 0 || MF.size() > 4)
+    reject("machine basic-block count is outside 1..4");
+
+  for (const MachineBasicBlock &MBB : MF)
+    verifyBlockEnvelope(MBB, DirectCall && IsHelper);
+}
+
+void verifyFinalMachineFunctionContents(MachineFunction &MF, bool AllowsHomes,
+                                        bool DirectCall) {
+  const bool IsEntry = MF.getName() == "brace_system_entry";
+  const bool IsHelper = MF.getName() == "brace_system_call_leaf";
+  unsigned OperationCount = 0;
+  unsigned EdgeCount = 0;
+  unsigned MemoryCount = 0;
+  unsigned CallCount = 0;
+  unsigned VoidReturnCount = 0;
+  unsigned ValueReturnCount = 0;
+  SmallPtrSet<const MachineBasicBlock *, 4> Reachable;
+  SmallVector<const MachineBasicBlock *, 4> Worklist{&MF.front()};
+  while (!Worklist.empty()) {
+    const MachineBasicBlock *Block = Worklist.pop_back_val();
+    if (!Reachable.insert(Block).second)
+      continue;
+    for (const MachineBasicBlock *Successor : Block->successors())
+      Worklist.push_back(Successor);
+  }
+  if (Reachable.size() != MF.size())
+    reject("all machine basic blocks must be CFG-reachable");
+
+  for (MachineBasicBlock &MBB : MF) {
+    EdgeCount += MBB.succ_size();
+    if (EdgeCount > (DirectCall ? 6U : 8U))
+      DirectCall ? rejectDirect("machine CFG edge count exceeds 6")
+                 : reject("machine CFG edge count exceeds 8");
+    unsigned BlockOperations = 0;
+    const auto LastIterator = MBB.getLastNonDebugInstr();
+    const MachineInstr *Last =
+        LastIterator == MBB.end() ? nullptr : &*LastIterator;
+    for (const MachineInstr &MI : MBB) {
+      if (MI.isDebugInstr())
+        reject("debug MachineInstr are not publishable");
+      verifyInstruction(MI, AllowsHomes, DirectCall);
+      CallCount += MI.getOpcode() == Brace::CALL_I32;
+      VoidReturnCount += MI.getOpcode() == Brace::RET;
+      ValueReturnCount += MI.getOpcode() == Brace::RET_I32;
+      if (MI.isTerminator() && &MI != Last)
+        reject("a terminator may only be the final operation in its block");
+      if (MI.mayLoad() || MI.mayStore()) {
+        if (++MemoryCount > 64)
+          DirectCall
+              ? rejectDirect(
+                    "published physical memory operation count exceeds 64")
+              : reject(
+                    "published physical memory operation count exceeds 64");
+      }
+      ++BlockOperations;
+      if (++OperationCount > 128)
+        DirectCall ? rejectDirect("published operation count exceeds 128")
+                   : reject("published operation count exceeds 128");
+    }
+    if (BlockOperations == 0)
+      reject("empty machine basic blocks are not publishable");
+
+    const MachineInstr &LastInstruction = *Last;
+    auto RequireSuccessor = [&](const MachineBasicBlock *Target) {
+      if (!Target || Target->getParent() != &MF || !MBB.isSuccessor(Target))
+        reject("branch target is not an emitting CFG successor");
+    };
+    switch (LastInstruction.getOpcode()) {
+    case Brace::BR:
+      if (MBB.succ_size() != 1)
+        reject("unconditional branch must have one successor");
+      RequireSuccessor(LastInstruction.getOperand(0).getMBB());
+      break;
+    case Brace::BR_IF8:
+    case Brace::BR_IF32: {
+      const MachineBasicBlock *TrueTarget =
+          LastInstruction.getOperand(1).getMBB();
+      const MachineBasicBlock *FalseTarget =
+          LastInstruction.getOperand(2).getMBB();
+      if (MBB.succ_size() != 2 || TrueTarget == FalseTarget)
+        reject("conditional branch must have two distinct successors");
+      RequireSuccessor(TrueTarget);
+      RequireSuccessor(FalseTarget);
+      break;
+    }
+    case Brace::RET:
+    case Brace::RET_I32:
+      if (!MBB.succ_empty())
+        reject("return block must have no successor");
+      break;
+    default:
+      break;
+    }
+    if (!LastInstruction.isTerminator()) {
+      if (!MBB.getNextNode() || MBB.succ_size() != 1 ||
+          *MBB.succ_begin() != MBB.getNextNode())
+        reject("implicit fallthrough does not match final layout");
+    }
+  }
+  if (DirectCall && ((IsEntry && (CallCount != 1 || ValueReturnCount != 0 ||
+                                  VoidReturnCount == 0)) ||
+                     (IsHelper && (CallCount != 0 || VoidReturnCount != 0 ||
+                                   ValueReturnCount == 0))))
+    rejectDirect("function Call/Return profile is not exact");
+  verifyRegisterDefinitions(
+      MF, DirectCall && IsHelper ? registerBit(Brace::R4) : 0, DirectCall);
+  if (AllowsHomes)
+    verifyHomeDefinitions(MF);
+  verifyPAddrReachingDefinitions(MF, DirectCall);
+}
+
 class BraceFinalizeBranchesLegacy final : public MachineFunctionPass {
   bool AllowsHomes = false;
+  bool DirectCall = false;
   std::string RequiredABI = BraceSdagLeafABIName.str();
 
 public:
@@ -706,6 +976,7 @@ public:
   BraceFinalizeBranchesLegacy() : MachineFunctionPass(ID) {}
   explicit BraceFinalizeBranchesLegacy(const BraceTargetMachine &TM)
       : MachineFunctionPass(ID), AllowsHomes(TM.usesSdagLeafHomeABI()),
+        DirectCall(TM.usesSdagDirectCallABI()),
         RequiredABI(TM.getSdagABIName()) {}
 
   bool runOnMachineFunction(MachineFunction &MF) override {
@@ -713,79 +984,24 @@ public:
     // complete embedded module here so a resumed compilation cannot pair an
     // exact command-line ABI with a stale or forged triple/layout/ABI body.
     verifyBraceS3LateModuleEnvelope(*MF.getFunction().getParent(), RequiredABI);
-    if (MF.getName() != "brace_system_entry")
-      reject("unexpected MachineFunction identity");
-    const MachineFunctionProperties &Properties = MF.getProperties();
-    if (MF.getAlignment() != Align(1) || MF.exposesReturnsTwice() ||
-        MF.hasInlineAsm() || MF.hasWinCFI() || MF.callsEHReturn() ||
-        MF.callsUnwindInit() || MF.hasEHContTarget() || MF.hasEHScopes() ||
-        MF.hasEHFunclets() || MF.hasFakeUses() || MF.isOutlined() ||
-        MF.useDebugInstrRef() || MF.hasDebugValueSubstitutions() ||
-        MF.hasDebugPHIPositions() || !MF.getVariableDbgInfo().empty() ||
-        !MF.getCallSitesInfo().empty() || !MF.getCalledGlobals().empty() ||
-        !MF.getLongjmpTargets().empty() || !MF.getEHContTargets().empty() ||
-        !MF.getLandingPads().empty() || MF.hasAnyCallSiteLandingPad() ||
-        MF.hasAnyCallSiteLabel() || !MF.getCodeViewAnnotations().empty() ||
-        !MF.getTypeInfos().empty() || !MF.getFilterIds().empty() ||
-        MF.getWasmEHFuncInfo() || MF.getWinEHFuncInfo() ||
-        (MF.getJumpTableInfo() && !MF.getJumpTableInfo()->isEmpty()) ||
-        (MF.getConstantPool() && !MF.getConstantPool()->isEmpty()) ||
-        Properties.hasFailedISel() || Properties.hasLegalized() ||
-        Properties.hasRegBankSelected() || Properties.hasSelected() ||
-        Properties.hasFailsVerification() || Properties.hasFailedRegAlloc())
-      reject("MachineFunction state is outside the finite leaf envelope");
+    bool Changed = false;
     MachineFrameInfo &Frame = MF.getFrameInfo();
-    if (Frame.getStackSize() != 0 || Frame.getNumFixedObjects() != 0 ||
-        Frame.hasVarSizedObjects() || Frame.hasStackProtectorIndex() ||
-        Frame.hasFunctionContextIndex() || Frame.getOffsetAdjustment() != 0 ||
-        Frame.getMaxCallFrameSize() != 0 ||
-        Frame.getCVBytesOfCalleeSavedRegisters() != 0 ||
-        !Frame.getCalleeSavedInfo().empty() ||
-        Frame.getLocalFrameObjectCount() != 0 ||
-        Frame.getLocalFrameSize() != 0 ||
-        Frame.getLocalFrameMaxAlign() != Align(1) ||
-        Frame.getUseLocalStackAllocationBlock() ||
-        !Frame.getSavePoints().empty() || !Frame.getRestorePoints().empty() ||
-        Frame.getUnsafeStackSize() != 0 || Frame.hasCalls() ||
-        Frame.isFrameAddressTaken() || Frame.isReturnAddressTaken() ||
-        Frame.hasStackMap() || Frame.hasPatchPoint() || Frame.adjustsStack() ||
-        Frame.hasOpaqueSPAdjustment() || Frame.hasVAStart() ||
-        Frame.hasCopyImplyingStackAdjustment() ||
-        Frame.hasMustTailInVarArgFunc() || Frame.hasTailCall())
-      reject("stack, frame, return-address, and call state are forbidden");
-    if (!AllowsHomes &&
-        (Frame.getNumObjects() != 0 || Frame.getMaxAlign() != Align(1)))
-      reject("S3b.3 leaf publication requires an exact empty frame");
-    if (AllowsHomes) {
-      if (Frame.getMaxAlign() > Align(4))
-        reject("spill-home frame metadata exceeds i32 alignment");
-      for (int FI = Frame.getObjectIndexBegin();
-           FI != Frame.getObjectIndexEnd(); ++FI)
-        if (!Frame.isDeadObjectIndex(FI) || !Frame.isSpillSlotObjectIndex(FI) ||
-            Frame.getObjectAllocation(FI) ||
-            Frame.isAliasedObjectIndex(FI) ||
-            Frame.getStackID(FI) != TargetStackID::Default)
-          reject("non-dead or non-spill frame object survived S3b.4");
+    // LLVM uses UINT_MAX as an uncomputed call-frame sentinel even though this
+    // profile emits no call-frame pseudo and requires an exact zero-byte frame.
+    // Canonicalize that one target-independent sentinel before publication.
+    if (DirectCall &&
+        Frame.getMaxCallFrameSize() ==
+            static_cast<uint64_t>(std::numeric_limits<unsigned>::max())) {
+      Frame.setMaxCallFrameSize(0);
+      Changed = true;
     }
-    const MachineRegisterInfo &MRI = MF.getRegInfo();
-    const MCPhysReg *CalleeSaved = MRI.getCalleeSavedRegs();
-    if (!MRI.tracksLiveness() || !MRI.livein_empty() ||
-        MRI.getNumVirtRegs() != 0 || (CalleeSaved && *CalleeSaved != 0) ||
-        !MF.getProperties().hasNoVRegs())
-      reject("live-in or virtual-register state survived physical rewrite");
-    if (MF.size() == 0 || MF.size() > 4)
-      reject("machine basic-block count is outside 1..4");
-
     // Validate every block before the only structural normalization below.
     // In particular, an instruction-free lexical entry must not be able to
     // launder live-in, EH, section, alignment, or address-taken state by being
     // erased before the publication trust boundary observes it.
-    for (const MachineBasicBlock &MBB : MF)
-      verifyBlockEnvelope(MBB);
+    verifyMachineFunctionEnvelope(MF, AllowsHomes, DirectCall);
 
     const auto &TII = *MF.getSubtarget<BraceSubtarget>().getInstrInfo();
-    bool Changed = false;
-
     // SelectionDAG can preserve an instruction-free IR entry block when its
     // only edge is the lexical fallthrough into a loop header.  It carries no
     // S2 location and must not become a second name for operation zero.  Drop
@@ -816,86 +1032,8 @@ public:
       }
     }
 
-    unsigned OperationCount = 0;
-    unsigned EdgeCount = 0;
-    unsigned MemoryCount = 0;
-    SmallPtrSet<const MachineBasicBlock *, 4> Reachable;
-    SmallVector<const MachineBasicBlock *, 4> Worklist{&MF.front()};
-    while (!Worklist.empty()) {
-      const MachineBasicBlock *Block = Worklist.pop_back_val();
-      if (!Reachable.insert(Block).second)
-        continue;
-      for (const MachineBasicBlock *Successor : Block->successors())
-        Worklist.push_back(Successor);
-    }
-    if (Reachable.size() != MF.size())
-      reject("all machine basic blocks must be CFG-reachable");
-
-    for (MachineBasicBlock &MBB : MF) {
-      EdgeCount += MBB.succ_size();
-      if (EdgeCount > 8)
-        reject("machine CFG edge count exceeds 8");
-      unsigned BlockOperations = 0;
-      const auto LastIterator = MBB.getLastNonDebugInstr();
-      const MachineInstr *Last =
-          LastIterator == MBB.end() ? nullptr : &*LastIterator;
-      for (const MachineInstr &MI : MBB) {
-        if (MI.isDebugInstr())
-          reject("debug MachineInstr are not publishable");
-        verifyInstruction(MI, AllowsHomes);
-        if (MI.isTerminator() && &MI != Last)
-          reject("a terminator may only be the final operation in its block");
-        if (MI.mayLoad() || MI.mayStore()) {
-          if (++MemoryCount > 64)
-            reject("published physical memory operation count exceeds 64");
-        }
-        ++BlockOperations;
-        if (++OperationCount > 128)
-          reject("published operation count exceeds 128");
-      }
-      if (BlockOperations == 0)
-        reject("empty machine basic blocks are not publishable");
-
-      const MachineInstr &LastInstruction = *Last;
-      auto RequireSuccessor = [&](const MachineBasicBlock *Target) {
-        if (!Target || Target->getParent() != &MF || !MBB.isSuccessor(Target))
-          reject("branch target is not an emitting CFG successor");
-      };
-      switch (LastInstruction.getOpcode()) {
-      case Brace::BR:
-        if (MBB.succ_size() != 1)
-          reject("unconditional branch must have one successor");
-        RequireSuccessor(LastInstruction.getOperand(0).getMBB());
-        break;
-      case Brace::BR_IF8:
-      case Brace::BR_IF32: {
-        const MachineBasicBlock *TrueTarget =
-            LastInstruction.getOperand(1).getMBB();
-        const MachineBasicBlock *FalseTarget =
-            LastInstruction.getOperand(2).getMBB();
-        if (MBB.succ_size() != 2 || TrueTarget == FalseTarget)
-          reject("conditional branch must have two distinct successors");
-        RequireSuccessor(TrueTarget);
-        RequireSuccessor(FalseTarget);
-        break;
-      }
-      case Brace::RET:
-        if (!MBB.succ_empty())
-          reject("return block must have no successor");
-        break;
-      default:
-        break;
-      }
-      if (!LastInstruction.isTerminator()) {
-        if (!MBB.getNextNode() || MBB.succ_size() != 1 ||
-            *MBB.succ_begin() != MBB.getNextNode())
-          reject("implicit fallthrough does not match final layout");
-      }
-    }
-    verifyRegisterDefinitions(MF);
-    if (AllowsHomes)
-      verifyHomeDefinitions(MF);
-    verifyPAddrReachingDefinitions(MF);
+    verifyBraceS3FinalMachineFunctionEnvelope(MF, AllowsHomes, DirectCall,
+                                              RequiredABI);
     return Changed;
   }
 
@@ -905,6 +1043,14 @@ public:
 };
 
 } // namespace
+
+void llvm::verifyBraceS3FinalMachineFunctionEnvelope(
+    MachineFunction &MF, bool AllowsHomes, bool DirectCall,
+    StringRef RequiredABI) {
+  verifyBraceS3LateModuleEnvelope(*MF.getFunction().getParent(), RequiredABI);
+  verifyMachineFunctionEnvelope(MF, AllowsHomes, DirectCall);
+  verifyFinalMachineFunctionContents(MF, AllowsHomes, DirectCall);
+}
 
 char BraceFinalizeBranchesLegacy::ID = 0;
 

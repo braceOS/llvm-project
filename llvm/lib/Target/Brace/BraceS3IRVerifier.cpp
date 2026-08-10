@@ -7,6 +7,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Attributes.h"
 #include "llvm/IR/CFG.h"
+#include "llvm/IR/ConstantRange.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instructions.h"
@@ -31,6 +32,10 @@ constexpr StringLiteral RequiredDataLayout =
 
 [[noreturn]] void reject(const Twine &Message) {
   report_fatal_error("brace64 S3b.3 leaf ABI: " + Message);
+}
+
+[[noreturn]] void rejectDirect(const Twine &Message) {
+  report_fatal_error("brace64 S3b.5 direct-call ABI: " + Message);
 }
 
 bool metadataI32Equals(const Metadata *MD, uint32_t Expected) {
@@ -122,6 +127,36 @@ void checkMemory(const StoreInst &Store) {
   checkMemoryShape(Type, Store.getPointerOperand(), Store.getAlign());
 }
 
+void checkDirectMemoryShape(Type *Type, const Value *Pointer, Align Alignment) {
+  if (!Type->isIntegerTy(8) && !Type->isIntegerTy(32))
+    rejectDirect("physical memory width must be i8 or i32");
+  const std::optional<uint64_t> Address = directPhysicalAddress(Pointer);
+  if (!Address)
+    rejectDirect(
+        "physical pointer must be a direct i64 addrspace(200) inttoptr");
+  const uint64_t Width = Type->getIntegerBitWidth() / 8;
+  const uint64_t DeclaredAlignment = Alignment.value();
+  if ((*Address % Width) != 0 || DeclaredAlignment < Width ||
+      (*Address % DeclaredAlignment) != 0)
+    rejectDirect("physical memory access is not naturally aligned");
+}
+
+void checkDirectMemory(const LoadInst &Load) {
+  if (!Load.isVolatile() || Load.isAtomic())
+    rejectDirect(
+        "loads must be volatile direct addrspace(200) i8/i32 accesses");
+  checkDirectMemoryShape(Load.getType(), Load.getPointerOperand(),
+                         Load.getAlign());
+}
+
+void checkDirectMemory(const StoreInst &Store) {
+  if (!Store.isVolatile() || Store.isAtomic())
+    rejectDirect(
+        "stores must be volatile direct addrspace(200) i8/i32 accesses");
+  checkDirectMemoryShape(Store.getValueOperand()->getType(),
+                         Store.getPointerOperand(), Store.getAlign());
+}
+
 void checkFunctionAttributes(const Function &F) {
   const AttributeList &Attrs = F.getAttributes();
   const AttributeSet FnAttrs = Attrs.getFnAttrs();
@@ -176,6 +211,25 @@ void checkInstructionMetadata(const Instruction &Instruction) {
                       return Successor == Branch->getParent();
                     }))
     reject("instruction metadata is outside the finite leaf envelope");
+}
+
+void checkDirectInstructionMetadata(const Instruction &Instruction) {
+  if (Instruction.getDebugLoc() || Instruction.hasDbgRecords())
+    rejectDirect("debug records are not admitted");
+  SmallVector<std::pair<unsigned, MDNode *>, 2> Metadata;
+  Instruction.getAllMetadataOtherThanDebugLoc(Metadata);
+  if (Metadata.empty())
+    return;
+  const auto *Branch = dyn_cast<BranchInst>(&Instruction);
+  if (!Branch || Metadata.size() != 1 ||
+      Metadata[0].first != LLVMContext::MD_loop ||
+      !canonicalLoopMetadata(Metadata[0].second) ||
+      llvm::none_of(successors(Branch->getParent()),
+                    [&](const BasicBlock *Successor) {
+                      return Successor == Branch->getParent();
+                    }))
+    rejectDirect(
+        "instruction metadata is outside the finite direct-call envelope");
 }
 
 void checkFunctionHeader(const Function &F) {
@@ -302,28 +356,437 @@ void checkFunction(const Function &F) {
   }
 }
 
+bool allowedDirectStringAttribute(const Attribute &A) {
+  const StringRef Kind = A.getKindAsString();
+  const StringRef Value = A.getValueAsString();
+  return allowedStringAttribute(A) ||
+         (Kind == "disable-tail-calls" && Value == "true");
+}
+
+bool hasDirectPhysicalMemory(const Function &F) {
+  for (const BasicBlock &Block : F)
+    for (const Instruction &I : Block)
+      if (isa<LoadInst>(I) || isa<StoreInst>(I))
+        return true;
+  return false;
+}
+
+void checkDirectFunctionAttributes(const Function &F, bool IsHelper,
+                                   bool HasPhysicalEffects) {
+  const AttributeList &Attrs = F.getAttributes();
+  const bool ExpectedNoSync = IsHelper && !HasPhysicalEffects;
+  const bool HasMustProgress = F.hasFnAttribute(Attribute::MustProgress);
+  const bool HasWillReturn = F.hasFnAttribute(Attribute::WillReturn);
+  const bool AllowsFrontendCFGProgressTuple =
+      IsHelper && HasPhysicalEffects && F.size() > 1;
+  if (!F.hasFnAttribute(Attribute::NoFree) ||
+      !F.hasFnAttribute(Attribute::NoRecurse) ||
+      !F.hasFnAttribute(Attribute::NoUnwind) ||
+      (IsHelper && (!F.hasFnAttribute(Attribute::NoInline) ||
+                    HasMustProgress != HasWillReturn ||
+                    (!AllowsFrontendCFGProgressTuple && !HasMustProgress))) ||
+      (!IsHelper && (F.hasFnAttribute(Attribute::NoInline) || HasMustProgress ||
+                     HasWillReturn)) ||
+      F.hasFnAttribute(Attribute::NoSync) != ExpectedNoSync)
+    rejectDirect("required function attributes are missing");
+
+  auto HasString = [&](StringRef Kind, StringRef Value) {
+    const Attribute A = F.getFnAttribute(Kind);
+    return A.isStringAttribute() && A.getValueAsString() == Value;
+  };
+  if (!HasString("disable-tail-calls", "true") ||
+      !HasString("no-builtins", "") || !HasString("no-trapping-math", "true") ||
+      !HasString("stack-protector-buffer-size", "8"))
+    rejectDirect("required string function attributes are missing");
+
+  bool SawMemory = false;
+  unsigned EnumCount = 0;
+  for (Attribute A : Attrs.getFnAttrs()) {
+    if (A.isStringAttribute()) {
+      if (!allowedDirectStringAttribute(A))
+        rejectDirect("unsupported string function attribute");
+      continue;
+    }
+    const Attribute::AttrKind Kind = A.getKindAsEnum();
+    if (A.isEnumAttribute() &&
+        (Kind == Attribute::NoFree || Kind == Attribute::NoRecurse ||
+         Kind == Attribute::NoUnwind || Kind == Attribute::NoInline ||
+         Kind == Attribute::MustProgress || Kind == Attribute::NoSync ||
+         Kind == Attribute::WillReturn)) {
+      ++EnumCount;
+      continue;
+    }
+    if (A.isIntAttribute() && Kind == Attribute::Memory) {
+      const MemoryEffects Actual =
+          MemoryEffects::createFromIntValue(A.getValueAsInt());
+      const MemoryEffects Expected =
+          HasPhysicalEffects ? MemoryEffects::unknown()
+                                   .getWithoutLoc(IRMemLocation::TargetMem0)
+                                   .getWithoutLoc(IRMemLocation::TargetMem1)
+                             : MemoryEffects::none();
+      if (!SawMemory && Actual == Expected) {
+        SawMemory = true;
+        continue;
+      }
+    }
+    rejectDirect("unsupported enum or integer function attribute");
+  }
+  if (!SawMemory)
+    rejectDirect("exact body-consistent memory effects are required");
+  const unsigned ExpectedEnumCount =
+      3 + (IsHelper ? 1U : 0U) + (HasMustProgress ? 1U : 0U) +
+      (HasWillReturn ? 1U : 0U) + (ExpectedNoSync ? 1U : 0U);
+  const unsigned ExpectedFnAttributeCount = ExpectedEnumCount + 1 + 4;
+  if (EnumCount != ExpectedEnumCount ||
+      Attrs.getFnAttrs().getNumAttributes() != ExpectedFnAttributeCount)
+    rejectDirect("function attribute set is not the exact registered tuple");
+
+  auto CanonicalHelperReturn = [&](const AttributeSet &Set) {
+    if (HasPhysicalEffects) {
+      if (Set.getNumAttributes() == 0)
+        return true;
+      if (Set.getNumAttributes() != 1)
+        return false;
+      const Attribute Range = *Set.begin();
+      if (!Range.isConstantRangeAttribute() ||
+          Range.getKindAsEnum() != Attribute::Range)
+        return false;
+      const ConstantRange Mask15(APInt(32, 0), APInt(32, 16));
+      const ConstantRange Mask13(APInt(32, 0), APInt(32, 14));
+      return Range.getRange() == Mask15 || Range.getRange() == Mask13;
+    }
+    bool HasNoUndef = false;
+    bool HasRange = false;
+    for (Attribute A : Set) {
+      if (A.isEnumAttribute() && A.getKindAsEnum() == Attribute::NoUndef) {
+        if (HasNoUndef)
+          return false;
+        HasNoUndef = true;
+        continue;
+      }
+      if (A.isConstantRangeAttribute() &&
+          A.getKindAsEnum() == Attribute::Range) {
+        const ConstantRange Expected(APInt(32, 0), APInt(32, 16));
+        if (HasRange || A.getRange() != Expected)
+          return false;
+        HasRange = true;
+        continue;
+      }
+      return false;
+    }
+    return HasNoUndef && HasRange && Set.getNumAttributes() == 2;
+  };
+  if ((!IsHelper && Attrs.getRetAttrs().getNumAttributes() != 0) ||
+      (IsHelper && !CanonicalHelperReturn(Attrs.getRetAttrs())))
+    rejectDirect("return attributes are outside the direct-call profile");
+  auto CanonicalParameter = [&](const AttributeSet &Set) {
+    bool HasNoUndef = false;
+    bool HasRange = false;
+    for (Attribute A : Set) {
+      if (A.isEnumAttribute() && A.getKindAsEnum() == Attribute::NoUndef) {
+        if (HasNoUndef)
+          return false;
+        HasNoUndef = true;
+        continue;
+      }
+      if (A.isConstantRangeAttribute() &&
+          A.getKindAsEnum() == Attribute::Range) {
+        const ConstantRange Argument28(APInt(32, 0), APInt(32, 1U << 28));
+        const ConstantRange Argument24(APInt(32, 0), APInt(32, 1U << 24));
+        if (HasRange ||
+            (A.getRange() != Argument28 && A.getRange() != Argument24))
+          return false;
+        HasRange = true;
+        continue;
+      }
+      return false;
+    }
+    return HasNoUndef && Set.getNumAttributes() == (HasRange ? 2U : 1U);
+  };
+  for (unsigned Index = 0; Index != F.arg_size(); ++Index) {
+    const AttributeSet ParamAttrs = Attrs.getParamAttrs(Index);
+    if (!CanonicalParameter(ParamAttrs))
+      rejectDirect("parameter attributes are outside the direct-call profile");
+  }
+}
+
+void checkDirectCallAttributes(const CallInst &Call) {
+  const AttributeList &Attrs = Call.getAttributes();
+  const AttributeSet FnAttrs = Attrs.getFnAttrs();
+  const Attribute NoBuiltins = Call.getFnAttr("no-builtins");
+  if (FnAttrs.getNumAttributes() != 2 || !Call.isNoBuiltin() ||
+      !NoBuiltins.isStringAttribute() ||
+      !NoBuiltins.getValueAsString().empty() ||
+      Attrs.getRetAttrs().getNumAttributes() != 0 ||
+      Attrs.getParamAttrs(0).getNumAttributes() != 1 ||
+      !Attrs.hasParamAttr(0, Attribute::NoUndef))
+    rejectDirect("call-site attributes are outside the direct-call profile");
+}
+
+void checkDirectFunctionHeader(const Function &F, bool IsHelper,
+                               bool HasPhysicalEffects) {
+  if (F.isDeclaration() || F.getAddressSpace() != 0 || F.isVarArg())
+    rejectDirect("function declaration or signature envelope mismatch");
+  if (IsHelper) {
+    if (F.getName() != "brace_system_call_leaf" || !F.hasInternalLinkage() ||
+        F.getCallingConv() != CallingConv::Fast || F.arg_size() != 1 ||
+        !F.getArg(0)->getType()->isIntegerTy(32) ||
+        !F.getReturnType()->isIntegerTy(32) ||
+        F.getUnnamedAddr() != GlobalValue::UnnamedAddr::Global)
+      rejectDirect(
+          "requires one private fastcc i32 brace_system_call_leaf(i32)");
+  } else if (F.getName() != "brace_system_entry" || !F.hasExternalLinkage() ||
+             F.getCallingConv() != CallingConv::C || !F.arg_empty() ||
+             !F.getReturnType()->isVoidTy() ||
+             F.getUnnamedAddr() != GlobalValue::UnnamedAddr::Local) {
+    rejectDirect("requires one external C void brace_system_entry(void)");
+  }
+  if (!F.isDSOLocal() || F.getVisibility() != GlobalValue::DefaultVisibility ||
+      F.getDLLStorageClass() != GlobalValue::DefaultStorageClass ||
+      F.hasPersonalityFn() || F.hasGC() || F.hasPrefixData() ||
+      F.hasPrologueData() || F.hasSection() || F.hasComdat() || F.getAlign() ||
+      !F.getPartition().empty() || F.getSectionPrefix().has_value() ||
+      F.hasSanitizerMetadata() || F.hasMetadata())
+    rejectDirect("function decoration is outside the direct-call profile");
+  checkDirectFunctionAttributes(F, IsHelper, HasPhysicalEffects);
+}
+
+struct DirectCounts final {
+  unsigned Instructions = 0;
+  unsigned Edges = 0;
+  unsigned Values = 0;
+  unsigned Memory = 0;
+  const CallInst *Call = nullptr;
+};
+
+DirectCounts checkDirectFunction(const Function &F, const Function &Helper,
+                                 bool IsHelper, bool HasPhysicalEffects) {
+  checkDirectFunctionHeader(F, IsHelper, HasPhysicalEffects);
+  if (F.empty() || F.size() > 4)
+    rejectDirect("basic-block count is outside 1..4");
+
+  SmallPtrSet<const BasicBlock *, 4> Reachable;
+  SmallVector<const BasicBlock *, 4> Worklist{&F.getEntryBlock()};
+  while (!Worklist.empty()) {
+    const BasicBlock *Block = Worklist.pop_back_val();
+    if (!Reachable.insert(Block).second)
+      continue;
+    for (const BasicBlock *Successor : successors(Block))
+      Worklist.push_back(Successor);
+  }
+  if (Reachable.size() != F.size())
+    rejectDirect("all basic blocks must be reachable from the entry");
+
+  DirectCounts Counts;
+  SmallPtrSet<const Value *, 32> Values;
+  if (IsHelper)
+    Values.insert(F.getArg(0));
+  for (const BasicBlock &Block : F)
+    for (const Instruction &I : Block)
+      if (!I.getType()->isVoidTy() && Values.insert(&I).second &&
+          Values.size() > 64)
+        rejectDirect("per-function tracked non-void value count exceeds 64");
+  Counts.Values = Values.size();
+
+  auto IsInteger = [&](const Value *V, Type *Expected = nullptr) {
+    Type *Ty = V->getType();
+    if ((Expected && Ty != Expected) ||
+        (!Ty->isIntegerTy(8) && !Ty->isIntegerTy(32)))
+      return false;
+    if (const auto *Constant = dyn_cast<ConstantInt>(V))
+      return Constant->getBitWidth() == Ty->getIntegerBitWidth();
+    if (const auto *Argument = dyn_cast<llvm::Argument>(V))
+      return Argument->getParent() == &F && IsHelper && Argument == F.getArg(0);
+    return Values.contains(V);
+  };
+
+  unsigned ReturnCount = 0;
+  for (const BasicBlock &Block : F) {
+    if (Block.empty())
+      rejectDirect("empty IR basic blocks are not admitted");
+    Counts.Edges += Block.getTerminator()->getNumSuccessors();
+    if (Counts.Edges > 6)
+      rejectDirect("CFG edge count exceeds 6");
+    for (const Instruction &I : Block) {
+      if (++Counts.Instructions > 128)
+        rejectDirect("IR instruction count exceeds 128");
+      checkDirectInstructionMetadata(I);
+      if (const auto *Load = dyn_cast<LoadInst>(&I)) {
+        if (++Counts.Memory > 64)
+          rejectDirect("physical memory operation count exceeds 64");
+        checkDirectMemory(*Load);
+        continue;
+      }
+      if (const auto *Store = dyn_cast<StoreInst>(&I)) {
+        if (++Counts.Memory > 64)
+          rejectDirect("physical memory operation count exceeds 64");
+        if (!IsInteger(Store->getValueOperand(),
+                       Store->getValueOperand()->getType()))
+          rejectDirect("store is outside the direct-call integer graph");
+        checkDirectMemory(*Store);
+        continue;
+      }
+      if (const auto *Binary = dyn_cast<BinaryOperator>(&I)) {
+        if (Binary->getOpcode() != Instruction::And || !IsInteger(Binary) ||
+            !IsInteger(Binary->getOperand(0), Binary->getType()) ||
+            !IsInteger(Binary->getOperand(1), Binary->getType()))
+          rejectDirect("only i8/i32 integer-and is admitted");
+        continue;
+      }
+      if (const auto *Compare = dyn_cast<ICmpInst>(&I)) {
+        const auto *Zero = dyn_cast<ConstantInt>(Compare->getOperand(1));
+        Type *ComparedType = Compare->getOperand(0)->getType();
+        if ((Compare->getPredicate() != ICmpInst::ICMP_EQ &&
+             Compare->getPredicate() != ICmpInst::ICMP_NE) ||
+            !Zero || !Zero->isZero() || !IsInteger(Compare->getOperand(0)) ||
+            !IsInteger(Compare->getOperand(1), ComparedType) ||
+            !Compare->hasOneUse() || !isa<BranchInst>(*Compare->user_begin()) ||
+            cast<BranchInst>(*Compare->user_begin())->getParent() !=
+                Compare->getParent())
+          rejectDirect(
+              "comparisons must be one-use i8/i32 eq/ne zero branches");
+        continue;
+      }
+      if (const auto *Branch = dyn_cast<BranchInst>(&I)) {
+        if (Branch->isConditional() &&
+            (!isa<ICmpInst>(Branch->getCondition()) ||
+             Branch->getSuccessor(0) == Branch->getSuccessor(1)))
+          rejectDirect(
+              "conditional branches must consume the admitted comparison");
+        continue;
+      }
+      if (const auto *Call = dyn_cast<CallInst>(&I)) {
+        if (IsHelper || Counts.Call || Call->getCalledFunction() != &Helper ||
+            Call->getCallingConv() != CallingConv::Fast || Call->isTailCall() ||
+            Call->arg_size() != 1 || !IsInteger(Call->getArgOperand(0)) ||
+            !Call->getArgOperand(0)->getType()->isIntegerTy(32) ||
+            !Call->getType()->isIntegerTy(32) || Call->hasOperandBundles() ||
+            Call->isInlineAsm())
+          rejectDirect("requires one non-tail private i32(i32) direct call");
+        checkDirectCallAttributes(*Call);
+        Counts.Call = Call;
+        continue;
+      }
+      if (const auto *Return = dyn_cast<ReturnInst>(&I)) {
+        ++ReturnCount;
+        if ((!IsHelper && Return->getReturnValue()) ||
+            (IsHelper &&
+             (!Return->getReturnValue() ||
+              !IsInteger(Return->getReturnValue()) ||
+              !Return->getReturnValue()->getType()->isIntegerTy(32))))
+          rejectDirect("function return shape does not match its signature");
+        continue;
+      }
+      rejectDirect("instruction is outside the S3b.5 direct-call profile");
+    }
+  }
+  if (ReturnCount == 0)
+    rejectDirect("each direct-call function requires a Return");
+  if ((!IsHelper && !Counts.Call) || (IsHelper && Counts.Call))
+    rejectDirect("entry must contain the only call and helper must be leaf");
+  if (!IsHelper && Counts.Call->use_empty())
+    rejectDirect("entry must consume the direct-call result");
+
+  if (!IsHelper) {
+    const BasicBlock *CallBlock = Counts.Call->getParent();
+    SmallPtrSet<const BasicBlock *, 4> BeforeCallBlocks;
+    Worklist.clear();
+    Worklist.push_back(&F.getEntryBlock());
+    while (!Worklist.empty()) {
+      const BasicBlock *Block = Worklist.pop_back_val();
+      if (!BeforeCallBlocks.insert(Block).second || Block == CallBlock)
+        continue;
+      if (isa<ReturnInst>(Block->getTerminator()))
+        rejectDirect("a root path can return before the direct call");
+      for (const BasicBlock *Successor : successors(Block))
+        Worklist.push_back(Successor);
+    }
+
+    SmallPtrSet<const BasicBlock *, 4> AfterCallBlocks;
+    for (const BasicBlock *Successor : successors(CallBlock))
+      Worklist.push_back(Successor);
+    while (!Worklist.empty()) {
+      const BasicBlock *Block = Worklist.pop_back_val();
+      if (Block == CallBlock)
+        rejectDirect("the direct call can execute more than once");
+      if (!AfterCallBlocks.insert(Block).second)
+        continue;
+      for (const BasicBlock *Successor : successors(Block))
+        Worklist.push_back(Successor);
+    }
+
+    SmallPtrSet<const Instruction *, 32> AfterCall;
+    SmallPtrSet<const Instruction *, 32> BeforeCall;
+    for (const BasicBlock &Block : F) {
+      bool SeenCall = false;
+      for (const Instruction &I : Block) {
+        if (&I == Counts.Call) {
+          SeenCall = true;
+          continue;
+        }
+        if ((&Block == CallBlock && SeenCall) ||
+            AfterCallBlocks.contains(&Block))
+          AfterCall.insert(&I);
+        else if (BeforeCallBlocks.contains(&Block))
+          BeforeCall.insert(&I);
+        else
+          rejectDirect("CFG cannot be partitioned around the direct call");
+      }
+    }
+    for (const Instruction *I : BeforeCall)
+      for (const User *U : I->users()) {
+        const auto *Use = dyn_cast<Instruction>(U);
+        if (Use && AfterCall.contains(Use))
+          rejectDirect("caller SSA value remains live across the call");
+      }
+    for (const User *U : Counts.Call->users()) {
+      const auto *Use = dyn_cast<Instruction>(U);
+      if (!Use || !AfterCall.contains(Use))
+        rejectDirect("direct-call result must be consumed after the call");
+    }
+  }
+  return Counts;
+}
+
 void checkModuleEnvelope(const Module &M, StringRef RequiredABI) {
+  const bool DirectCall = RequiredABI == BraceSdagDirectCallABIName;
   if (M.getTargetTriple().str() != RequiredTriple ||
-      M.getDataLayoutStr() != RequiredDataLayout)
+      M.getDataLayoutStr() != RequiredDataLayout) {
+    if (DirectCall)
+      rejectDirect("target triple or data layout mismatch");
     reject("target triple or data layout mismatch");
+  }
   if (!M.getModuleInlineAsm().empty() || !M.global_empty() ||
-      !M.alias_empty() || !M.ifunc_empty())
+      !M.alias_empty() || !M.ifunc_empty()) {
+    if (DirectCall)
+      rejectDirect("globals, aliases, ifuncs, and module asm are not admitted");
     reject("globals, aliases, ifuncs, and module asm are not admitted");
+  }
   if (!M.getIdentifiedStructTypes().empty() ||
-      !M.getComdatSymbolTable().empty())
+      !M.getComdatSymbolTable().empty()) {
+    if (DirectCall)
+      rejectDirect("identified types and COMDAT are not admitted");
     reject("identified types and COMDAT are not admitted");
-  if (std::distance(M.begin(), M.end()) != 1)
+  }
+  if (std::distance(M.begin(), M.end()) != (DirectCall ? 2 : 1)) {
+    if (DirectCall)
+      rejectDirect("exactly two functions are required");
     reject("exactly one function is required");
+  }
 
   unsigned NamedCount = 0;
   for (const NamedMDNode &Named : M.named_metadata()) {
     ++NamedCount;
     if (Named.getName() != "llvm.module.flags" ||
         !canonicalModuleFlags(Named, RequiredABI))
-      reject("noncanonical named metadata or module flags");
+      DirectCall ? rejectDirect("noncanonical named metadata or module flags")
+                 : reject("noncanonical named metadata or module flags");
   }
   if (NamedCount != 1)
-    reject("the exact wchar and target-abi module flags are required");
+    DirectCall
+        ? rejectDirect(
+              "the exact wchar and target-abi module flags are required")
+        : reject("the exact wchar and target-abi module flags are required");
 }
 
 class BraceS3IRVerifier final : public ModulePass {
@@ -340,7 +803,7 @@ public:
   }
 
   StringRef getPassName() const override {
-    return "Brace S3b.3 leaf IR verifier";
+    return "Brace SelectionDAG IR verifier";
   }
 };
 
@@ -348,12 +811,47 @@ public:
 
 void llvm::verifyBraceS3IRModule(const Module &M, StringRef RequiredABI) {
   checkModuleEnvelope(M, RequiredABI);
+  if (RequiredABI == BraceSdagDirectCallABIName) {
+    const Function *Entry = M.getFunction("brace_system_entry");
+    const Function *Helper = M.getFunction("brace_system_call_leaf");
+    if (!Entry || !Helper)
+      rejectDirect("required entry or helper identity is missing");
+    for (const User *U : Helper->users()) {
+      const auto *Call = dyn_cast<CallInst>(U);
+      if (!Call || Call->getCalledFunction() != Helper ||
+          Call->getFunction() != Entry)
+        rejectDirect("helper address escapes the single direct call");
+    }
+    const bool HelperPhysical = hasDirectPhysicalMemory(*Helper);
+    const DirectCounts EntryCounts =
+        checkDirectFunction(*Entry, *Helper, false,
+                            hasDirectPhysicalMemory(*Entry) || HelperPhysical);
+    const DirectCounts HelperCounts =
+        checkDirectFunction(*Helper, *Helper, true, HelperPhysical);
+    if (EntryCounts.Instructions + HelperCounts.Instructions > 199 ||
+        EntryCounts.Edges + HelperCounts.Edges > 12 ||
+        EntryCounts.Values + HelperCounts.Values > 128 ||
+        EntryCounts.Memory + HelperCounts.Memory > 64)
+      rejectDirect("module resource limit exceeded");
+    return;
+  }
   checkFunction(*M.begin());
 }
 
 void llvm::verifyBraceS3LateModuleEnvelope(const Module &M,
                                            StringRef RequiredABI) {
   checkModuleEnvelope(M, RequiredABI);
+  if (RequiredABI == BraceSdagDirectCallABIName) {
+    const Function *Entry = M.getFunction("brace_system_entry");
+    const Function *Helper = M.getFunction("brace_system_call_leaf");
+    if (!Entry || !Helper)
+      rejectDirect("required entry or helper identity is missing");
+    const bool HelperPhysical = hasDirectPhysicalMemory(*Helper);
+    checkDirectFunctionHeader(
+        *Entry, false, hasDirectPhysicalMemory(*Entry) || HelperPhysical);
+    checkDirectFunctionHeader(*Helper, true, HelperPhysical);
+    return;
+  }
   checkFunctionHeader(*M.begin());
 }
 

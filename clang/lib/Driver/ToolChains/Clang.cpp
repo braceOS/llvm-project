@@ -2012,16 +2012,43 @@ void Clang::AddPPCTargetArgs(const ArgList &Args,
 
 void Clang::AddBraceTargetArgs(const ArgList &Args,
                                ArgStringList &CmdArgs) const {
+  for (const Arg *XClangArg : Args.filtered(options::OPT_Xclang)) {
+    StringRef Value = XClangArg->getValue();
+    if (Value == "-target-abi" || Value.starts_with("-target-abi=")) {
+      getToolChain().getDriver().Diag(diag::err_drv_unsupported_opt_for_target)
+          << XClangArg->getAsString(Args)
+          << getToolChain().getTriple().str();
+      return;
+    }
+  }
+
   const Arg *A = Args.getLastArg(options::OPT_mabi_EQ);
   if (!A)
     return;
 
   StringRef ABIName = A->getValue();
   if (ABIName != "brace-system-s2-leaf-r0" &&
-      ABIName != "brace-system-s2-leaf-home-r0") {
+      ABIName != "brace-system-s2-leaf-home-r0" &&
+      ABIName != "brace-system-s2-direct-call-r0") {
     getToolChain().getDriver().Diag(diag::err_drv_unsupported_option_argument)
         << A->getSpelling() << ABIName;
     return;
+  }
+
+  if (ABIName == "brace-system-s2-direct-call-r0") {
+    const Arg *Unsupported =
+        Args.getLastArg(options::OPT_flto, options::OPT_flto_EQ);
+    if (!Unsupported)
+      Unsupported = Args.getLastArg(options::OPT_mllvm);
+    if (!Unsupported)
+      Unsupported = Args.getLastArg(options::OPT_fexceptions);
+    if (!Unsupported)
+      Unsupported = Args.getLastArg(options::OPT_Xclang);
+    if (Unsupported) {
+      getToolChain().getDriver().Diag(diag::err_drv_unsupported_opt_for_target)
+          << Unsupported->getAsString(Args) << getToolChain().getTriple().str();
+      return;
+    }
   }
 
   CmdArgs.push_back("-target-abi");

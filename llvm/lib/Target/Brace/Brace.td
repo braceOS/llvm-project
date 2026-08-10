@@ -50,6 +50,10 @@ def S2_BRANCH : S2MCInst<"s2.branch", (ins S2Imm:$target)>;
 def S2_BRANCH_IF : S2MCInst<"s2.branch-if",
     (ins S2Imm:$condition, S2Imm:$true_target, S2Imm:$false_target)>;
 def S2_RETURN : S2MCInst<"s2.return", (ins)>;
+def S2_RETURN_VALUE : S2MCInst<"s2.return-value",
+    (ins S2Imm:$value)>;
+def S2_DIRECT_CALL : S2MCInst<"s2.direct-call",
+    (ins S2Imm:$target, S2Imm:$result, S2Imm:$argument)>;
 def S2_PHYSICAL_ADDRESS : S2MCInst<"s2.physical-address",
     (ins S2Imm:$destination, S2Imm:$address)>;
 def S2_PHYSICAL_LOAD : S2MCInst<"s2.physical-load",
@@ -63,6 +67,7 @@ def BraceImm64 : Operand<i64>;
 def BraceMBB : Operand<OtherVT>;
 def BraceFrameIndex : Operand<i64>;
 def BraceHome : Operand<i32>;
+def BraceCallTarget : Operand<i64>;
 
 class BraceMI<dag outs, dag ins, string mnemonic> : Instruction {
   let Namespace = "Brace";
@@ -182,6 +187,15 @@ let isBranch = 1, isTerminator = 1 in {
 
 let isReturn = 1, isTerminator = 1,
     isBarrier = 1 in def RET : BraceMI<(outs), (ins), "ret">;
+
+let isCall = 1, hasSideEffects = 1, Defs = [R4],
+    Uses = [R4] in def CALL_I32
+    : BraceMI<(outs), (ins BraceCallTarget:$target, variable_ops),
+              "call_i32 $target">;
+
+let isReturn = 1, isTerminator = 1,
+    isBarrier = 1 in def RET_I32
+    : BraceMI<(outs), (ins I32Regs:$value), "ret_i32 $value">;
 
 def CSR_NoRegs : CalleeSavedRegs<(add)>;
 
