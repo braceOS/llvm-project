@@ -620,14 +620,19 @@ static int compileModule(char **argv, SmallVectorImpl<PassPlugin> &PluginList,
       const StringRef BraceABI = Options.MCOptions.getABIName();
       const bool BraceDirectCallABI =
           BraceABI == "brace-system-s2-direct-call-r0";
+      const bool BraceDirectCallHomeABI =
+          BraceABI == "brace-system-s2-direct-call-home-r0";
       if ((BraceABI == "brace-system-s2-leaf-r0" ||
-           BraceABI == "brace-system-s2-leaf-home-r0" || BraceDirectCallABI) &&
+           BraceABI == "brace-system-s2-leaf-home-r0" || BraceDirectCallABI ||
+           BraceDirectCallHomeABI) &&
           (Triple::normalize(DataLayoutTargetTriple) !=
                "brace64-unknown-none-elf" ||
            OldDLStr != "e-m:e-p:64:64-i64:64-i128:128-n32:64-S128")) {
         if (!RejectedBraceS3InputEnvelope)
           WithColor::error(errs(), argv[0])
-              << (BraceDirectCallABI
+              << (BraceDirectCallHomeABI
+                      ? "brace64 S3b.6 input triple or data layout mismatch\n"
+                  : BraceDirectCallABI
                       ? "brace64 S3b.5 input triple or data layout mismatch\n"
                       : "brace64 S3b.3 input triple or data layout mismatch\n");
         RejectedBraceS3InputEnvelope = true;

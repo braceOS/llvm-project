@@ -10,6 +10,10 @@
 // RUN: %clang -### --target=brace64-unknown-none-elf -ffreestanding \
 // RUN:   -nostdinc -c -emit-llvm -mabi=brace-system-s2-direct-call-r0 %s \
 // RUN:   2>&1 | FileCheck -check-prefix=CALL-ABI %s
+// RUN: %clang -### --target=brace64-unknown-none-elf -ffreestanding \
+// RUN:   -nostdinc -c -emit-llvm \
+// RUN:   -mabi=brace-system-s2-direct-call-home-r0 %s 2>&1 | \
+// RUN:   FileCheck -check-prefix=CALL-HOME-ABI %s
 // RUN: not %clang -### --target=brace64-unknown-none-elf -ffreestanding \
 // RUN:   -nostdinc -c -emit-llvm -mabi=not-brace %s 2>&1 | \
 // RUN:   FileCheck -check-prefix=BAD-ABI %s
@@ -58,6 +62,10 @@
 // CALL-ABI: "-cc1"
 // CALL-ABI-SAME: "-triple" "brace64-unknown-none-elf"
 // CALL-ABI-SAME: "-target-abi" "brace-system-s2-direct-call-r0"
+
+// CALL-HOME-ABI: "-cc1"
+// CALL-HOME-ABI-SAME: "-triple" "brace64-unknown-none-elf"
+// CALL-HOME-ABI-SAME: "-target-abi" "brace-system-s2-direct-call-home-r0"
 
 // BAD-ABI: error: unsupported argument 'not-brace' to option '-mabi='
 

@@ -47,6 +47,7 @@ constexpr uint64_t S2RelocationBase = UINT64_C(0x40000000);
 enum class S2ObjectMode : uint8_t {
   Legacy,
   DirectCall,
+  DirectCallHome,
 };
 
 struct S2DirectFunction final {

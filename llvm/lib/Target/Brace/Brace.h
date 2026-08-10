@@ -45,6 +45,8 @@ inline constexpr StringLiteral BraceSdagLeafHomeABIName =
     "brace-system-s2-leaf-home-r0";
 inline constexpr StringLiteral BraceSdagDirectCallABIName =
     "brace-system-s2-direct-call-r0";
+inline constexpr StringLiteral BraceSdagDirectCallHomeABIName =
+    "brace-system-s2-direct-call-home-r0";
 inline constexpr StringLiteral BraceSdagLeafHomeCompilerIdentity =
     "brace.exp.llvm22.brace64.system.r32-physical.sdag-leaf-spill-home@0";
 inline constexpr StringLiteral BraceSdagLeafHomeCodegenProfile =
@@ -53,6 +55,10 @@ inline constexpr StringLiteral BraceSdagDirectCallCompilerIdentity =
     "brace.exp.llvm22.brace64.system.r32-physical.sdag-direct-call@0";
 inline constexpr StringLiteral BraceSdagDirectCallCodegenProfile =
     "brace.exp.llvm22.brace64.system.direct-call-codegen@0";
+inline constexpr StringLiteral BraceSdagDirectCallHomeCompilerIdentity =
+    "brace.exp.llvm22.brace64.system.r32-physical.sdag-direct-call-home@0";
+inline constexpr StringLiteral BraceSdagDirectCallHomeCodegenProfile =
+    "brace.exp.llvm22.brace64.system.direct-call-home-codegen@0";
 
 } // namespace llvm
 

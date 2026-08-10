@@ -69,7 +69,8 @@ public:
   bool setABI(const std::string &Name) override {
     if (Name != "brace-system-s2-leaf-r0" &&
         Name != "brace-system-s2-leaf-home-r0" &&
-        Name != "brace-system-s2-direct-call-r0")
+        Name != "brace-system-s2-direct-call-r0" &&
+        Name != "brace-system-s2-direct-call-home-r0")
       return false;
     ABI = Name;
     return true;

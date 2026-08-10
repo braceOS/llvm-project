@@ -38,6 +38,10 @@ bool BraceRegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator MI, int,
                 BraceSdagDirectCallABIName)
     report_fatal_error(
         "brace64 S3b.5 call-live activation home is unsupported");
+  if (MF && MF->getTarget().Options.MCOptions.getABIName() ==
+                BraceSdagDirectCallHomeABIName)
+    report_fatal_error(
+        "brace64 S3b.6 activation-home frame index survived finalization");
   report_fatal_error(
       "brace64 S3b.3 leaf ABI does not admit stack frame indices");
 }

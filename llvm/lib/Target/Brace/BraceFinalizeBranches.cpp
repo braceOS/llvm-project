@@ -39,6 +39,10 @@ namespace {
   report_fatal_error("brace64 S3b.5 post-RA verifier: " + Message);
 }
 
+[[noreturn]] void rejectDirectHome(const Twine &Message) {
+  report_fatal_error("brace64 S3b.6 post-home verifier: " + Message);
+}
+
 bool isInteger8(Register Reg) { return Brace::I8RegsRegClass.contains(Reg); }
 
 bool isInteger32(Register Reg) { return Brace::I32RegsRegClass.contains(Reg); }
@@ -687,6 +691,245 @@ void verifyHomeDefinitions(MachineFunction &MF) {
       reject("every published semantic home requires both save and restore");
 }
 
+void verifyDirectCallHomeResultFlow(MachineFunction &MF) {
+  // This is deliberately a MachineFunction-local reconstruction.  The exact
+  // S2 writer performs its own operation-table analysis and is not authority
+  // for a final-MIR restart that must fail at the publication seam itself.
+  constexpr uint8_t BeforeCall = UINT8_C(1) << 0;
+  constexpr uint8_t Unconsumed = UINT8_C(1) << 1;
+  constexpr uint8_t Consumed = UINT8_C(1) << 2;
+  constexpr uint8_t Overwritten = UINT8_C(1) << 3;
+  constexpr uint8_t RepeatedCall = UINT8_C(1) << 4;
+
+  auto TransferInstruction = [&](const MachineInstr &MI, uint8_t State) {
+    if (MI.getOpcode() == Brace::CALL_I32) {
+      uint8_t Next = 0;
+      if ((State & BeforeCall) != 0)
+        Next |= Unconsumed;
+      if ((State & (Unconsumed | Consumed | Overwritten | RepeatedCall)) != 0)
+        Next |= RepeatedCall;
+      return Next;
+    }
+
+    bool ReadsResult = false;
+    bool DefinesResult = false;
+    for (const MachineOperand &Operand : MI.operands()) {
+      if (!Operand.isReg() || Operand.getReg() != Brace::R4)
+        continue;
+      ReadsResult |= Operand.readsReg();
+      DefinesResult |= Operand.isDef();
+    }
+    if ((State & Unconsumed) != 0) {
+      State &= static_cast<uint8_t>(~Unconsumed);
+      if (ReadsResult)
+        State |= Consumed;
+      else if (DefinesResult)
+        State |= Overwritten;
+      else
+        State |= Unconsumed;
+    }
+    return State;
+  };
+  auto TransferBlock = [&](const MachineBasicBlock &MBB, uint8_t State) {
+    for (const MachineInstr &MI : MBB)
+      State = TransferInstruction(MI, State);
+    return State;
+  };
+
+  DenseMap<const MachineBasicBlock *, uint8_t> In;
+  DenseMap<const MachineBasicBlock *, uint8_t> Out;
+  bool Changed = true;
+  unsigned Iterations = 0;
+  while (Changed) {
+    if (++Iterations > 32)
+      rejectDirectHome("direct-call result-flow analysis did not converge");
+    Changed = false;
+    for (const MachineBasicBlock &MBB : MF) {
+      uint8_t NewIn = &MBB == &MF.front() ? BeforeCall : 0;
+      for (const MachineBasicBlock *Predecessor : MBB.predecessors())
+        NewIn |= Out[Predecessor];
+      const uint8_t NewOut = TransferBlock(MBB, NewIn);
+      if (In[&MBB] != NewIn || Out[&MBB] != NewOut) {
+        In[&MBB] = NewIn;
+        Out[&MBB] = NewOut;
+        Changed = true;
+      }
+    }
+  }
+
+  for (const MachineBasicBlock &MBB : MF) {
+    uint8_t State = In[&MBB];
+    for (const MachineInstr &MI : MBB) {
+      State = TransferInstruction(MI, State);
+      if ((State & RepeatedCall) != 0)
+        rejectDirectHome("entry direct call can execute more than once");
+      if ((State & Overwritten) != 0)
+        rejectDirectHome(
+            "direct-call result is overwritten before consumption");
+      if (MI.getOpcode() == Brace::RET && State != Consumed)
+        rejectDirectHome(
+            "direct-call result is not consumed on every root exit path");
+    }
+  }
+}
+
+void verifyDirectCallHomeCompilerShape(MachineFunction &MF) {
+  const MachineInstr *Call = nullptr;
+  const MachineInstr *Save = nullptr;
+  const MachineInstr *Restore = nullptr;
+  unsigned HomeOperationCount = 0;
+  for (const MachineBasicBlock &MBB : MF)
+    for (const MachineInstr &MI : MBB) {
+      if (MI.getOpcode() == Brace::CALL_I32)
+        Call = &MI;
+      if (!isHomeSave(MI) && !isHomeRestore(MI))
+        continue;
+      ++HomeOperationCount;
+      if (MI.getOpcode() == Brace::HOME_SAVE32 && MI.getOperand(0).isImm() &&
+          MI.getOperand(0).getImm() == 0 && !Save)
+        Save = &MI;
+      else if (MI.getOpcode() == Brace::HOME_RESTORE32 &&
+               MI.getOperand(1).isImm() && MI.getOperand(1).getImm() == 0 &&
+               !Restore)
+        Restore = &MI;
+    }
+
+  if (MF.getName() == "brace_system_call_leaf") {
+    if (HomeOperationCount != 0)
+      rejectDirectHome("helper must not publish an activation home");
+    return;
+  }
+  if (MF.getName() != "brace_system_entry" || !Call)
+    rejectDirectHome("unexpected function or missing direct call");
+  verifyDirectCallHomeResultFlow(MF);
+  if (HomeOperationCount == 0)
+    return;
+  if (HomeOperationCount != 2 || !Save || !Restore ||
+      Save->getNextNode() != Call || Call->getNextNode() != Restore)
+    rejectDirectHome(
+        "H1 requires one i32 h0 save immediately before Call and restore "
+        "immediately after Return");
+
+  struct HomeFlowState {
+    uint8_t Tainted = 0;
+    uint8_t LoadDerived = 0;
+    bool Observed = false;
+    bool SavedLoad = false;
+
+    bool operator==(const HomeFlowState &Other) const {
+      return Tainted == Other.Tainted && LoadDerived == Other.LoadDerived &&
+             Observed == Other.Observed && SavedLoad == Other.SavedLoad;
+    }
+  };
+  auto Transfer = [](const MachineBasicBlock &MBB, HomeFlowState State) {
+    for (const MachineInstr &MI : MBB) {
+      if ((MI.getOpcode() == Brace::STORE8 ||
+           MI.getOpcode() == Brace::STORE32) &&
+          (State.Tainted & registerBit(MI.getOperand(1).getReg())) != 0)
+        State.Observed = true;
+      if (MI.getOpcode() == Brace::HOME_SAVE32 &&
+          (State.LoadDerived & registerBit(MI.getOperand(1).getReg())) != 0)
+        State.SavedLoad = true;
+
+      uint8_t Derived = 0;
+      uint8_t LoadDerived = 0;
+      switch (MI.getOpcode()) {
+      case Brace::AND8:
+      case Brace::AND32:
+        if ((State.Tainted & registerBit(MI.getOperand(1).getReg())) != 0 ||
+            (State.Tainted & registerBit(MI.getOperand(2).getReg())) != 0)
+          Derived = registerBit(MI.getOperand(0).getReg());
+        if ((State.LoadDerived & registerBit(MI.getOperand(1).getReg())) != 0 ||
+            (State.LoadDerived & registerBit(MI.getOperand(2).getReg())) != 0)
+          LoadDerived = registerBit(MI.getOperand(0).getReg());
+        break;
+      case Brace::MOV8:
+      case Brace::MOV32:
+        if ((State.Tainted & registerBit(MI.getOperand(1).getReg())) != 0)
+          Derived = registerBit(MI.getOperand(0).getReg());
+        if ((State.LoadDerived & registerBit(MI.getOperand(1).getReg())) != 0)
+          LoadDerived = registerBit(MI.getOperand(0).getReg());
+        break;
+      default:
+        break;
+      }
+
+      if (MI.getOpcode() == Brace::CALL_I32) {
+        State.Tainted = 0;
+        State.LoadDerived = 0;
+        continue;
+      }
+      for (const MachineOperand &Operand : MI.operands()) {
+        if (Operand.isReg() && Operand.isDef()) {
+          State.Tainted &= static_cast<uint8_t>(~registerBit(Operand.getReg()));
+          State.LoadDerived &=
+              static_cast<uint8_t>(~registerBit(Operand.getReg()));
+        }
+      }
+      State.Tainted |= Derived;
+      State.LoadDerived |= LoadDerived;
+      if (MI.getOpcode() == Brace::LOAD32)
+        State.LoadDerived |= registerBit(MI.getOperand(0).getReg());
+      if (MI.getOpcode() == Brace::HOME_RESTORE32)
+        State.Tainted |= registerBit(MI.getOperand(0).getReg());
+    }
+    return State;
+  };
+
+  constexpr HomeFlowState Universal{UINT8_C(0x3f), UINT8_C(0x3f), true, true};
+  DenseMap<const MachineBasicBlock *, HomeFlowState> In;
+  DenseMap<const MachineBasicBlock *, HomeFlowState> Out;
+  for (const MachineBasicBlock &MBB : MF) {
+    const HomeFlowState Initial =
+        &MBB == &MF.front() ? HomeFlowState{} : Universal;
+    In[&MBB] = Initial;
+    Out[&MBB] = Transfer(MBB, Initial);
+  }
+
+  bool Changed = true;
+  unsigned Iterations = 0;
+  while (Changed) {
+    if (++Iterations > 32)
+      rejectDirectHome(
+          "restored-home observable-flow analysis did not converge");
+    Changed = false;
+    for (const MachineBasicBlock &MBB : MF) {
+      HomeFlowState NewIn{};
+      if (&MBB != &MF.front()) {
+        NewIn = Universal;
+        bool HasPredecessor = false;
+        for (const MachineBasicBlock *Predecessor : MBB.predecessors()) {
+          NewIn.Tainted &= Out[Predecessor].Tainted;
+          NewIn.LoadDerived &= Out[Predecessor].LoadDerived;
+          NewIn.Observed = NewIn.Observed && Out[Predecessor].Observed;
+          NewIn.SavedLoad = NewIn.SavedLoad && Out[Predecessor].SavedLoad;
+          HasPredecessor = true;
+        }
+        if (!HasPredecessor)
+          rejectDirectHome("non-entry block has no restored-home predecessor");
+      }
+      const HomeFlowState NewOut = Transfer(MBB, NewIn);
+      if (!(In[&MBB] == NewIn) || !(Out[&MBB] == NewOut)) {
+        In[&MBB] = NewIn;
+        Out[&MBB] = NewOut;
+        Changed = true;
+      }
+    }
+  }
+  for (const MachineBasicBlock &MBB : MF) {
+    const MachineInstr *Last = MBB.getLastNonDebugInstr() == MBB.end()
+                                   ? nullptr
+                                   : &*MBB.getLastNonDebugInstr();
+    if (!Last || Last->getOpcode() != Brace::RET)
+      continue;
+    if (!Out[&MBB].SavedLoad)
+      rejectDirectHome("saved h0 does not originate from a physical i32 load");
+    if (!Out[&MBB].Observed)
+      rejectDirectHome(
+          "restored h0 does not reach a physical store on every exit");
+  }
+}
+
 void transferPAddrDefinitions(const MachineBasicBlock &MBB, PAddrState &State,
                               bool DirectCall) {
   if (!State.Reachable)
@@ -975,9 +1218,9 @@ public:
   static char ID;
   BraceFinalizeBranchesLegacy() : MachineFunctionPass(ID) {}
   explicit BraceFinalizeBranchesLegacy(const BraceTargetMachine &TM)
-      : MachineFunctionPass(ID), AllowsHomes(TM.usesSdagLeafHomeABI()),
-        DirectCall(TM.usesSdagDirectCallABI()),
-        RequiredABI(TM.getSdagABIName()) {}
+      : MachineFunctionPass(ID), AllowsHomes(TM.usesSdagSpillHomes()),
+        DirectCall(TM.usesSdagDirectCalls()), RequiredABI(TM.getSdagABIName()) {
+  }
 
   bool runOnMachineFunction(MachineFunction &MF) override {
     // MIR restart seams skip the ordinary IR pass pipeline.  Recheck the
@@ -1050,6 +1293,8 @@ void llvm::verifyBraceS3FinalMachineFunctionEnvelope(
   verifyBraceS3LateModuleEnvelope(*MF.getFunction().getParent(), RequiredABI);
   verifyMachineFunctionEnvelope(MF, AllowsHomes, DirectCall);
   verifyFinalMachineFunctionContents(MF, AllowsHomes, DirectCall);
+  if (RequiredABI == BraceSdagDirectCallHomeABIName)
+    verifyDirectCallHomeCompilerShape(MF);
 }
 
 char BraceFinalizeBranchesLegacy::ID = 0;

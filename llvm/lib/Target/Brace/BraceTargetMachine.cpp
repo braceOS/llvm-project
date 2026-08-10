@@ -64,7 +64,8 @@ public:
   void addBlockPlacement() override {}
 
   void addPostRegAlloc() override {
-    if (getBraceTargetMachine().usesSdagLeafHomeABI()) {
+    if (getBraceTargetMachine().usesSdagLeafHomeABI() ||
+        getBraceTargetMachine().usesSdagDirectCallHomeABI()) {
       addPass(createMachineVerifierPass(
           "Before Brace S3b.4 spill-home finalization"));
       addPass(createBraceFinalizeSpillHomesPass());
@@ -75,7 +76,7 @@ public:
   }
 
   void addPreEmitPass2() override {
-    const bool Homes = getBraceTargetMachine().usesSdagLeafHomeABI();
+    const bool Homes = getBraceTargetMachine().usesSdagSpillHomes();
     addPass(createMachineVerifierPass(Homes
                                           ? "Before Brace S3b.4 publication"
                                           : "Before Brace S3b.3 publication"));
@@ -105,13 +106,18 @@ BraceTargetMachine::BraceTargetMachine(const Target &T, const Triple &TT,
     SdagABI = SdagABIKind::LeafHome;
   else if (ABI == BraceSdagDirectCallABIName)
     SdagABI = SdagABIKind::DirectCall;
+  else if (ABI == BraceSdagDirectCallHomeABIName)
+    SdagABI = SdagABIKind::DirectCallHome;
   UnsupportedConfiguration =
       (RM && *RM != Reloc::Static) ||
-      (SdagABI == SdagABIKind::DirectCall && CM.has_value()) ||
+      ((SdagABI == SdagABIKind::DirectCall ||
+        SdagABI == SdagABIKind::DirectCallHome) &&
+       CM.has_value()) ||
       (CM && *CM != CodeModel::Small) || JIT || OL != CodeGenOptLevel::Less ||
       (!CPU.empty() && CPU != "generic") || !FS.empty() ||
       (!ABI.empty() && ABI != BraceSdagLeafABIName &&
-       ABI != BraceSdagLeafHomeABIName && ABI != BraceSdagDirectCallABIName);
+       ABI != BraceSdagLeafHomeABIName && ABI != BraceSdagDirectCallABIName &&
+       ABI != BraceSdagDirectCallHomeABIName);
   initAsmInfo();
   setFastISel(false);
   setO0WantsFastISel(false);
@@ -129,6 +135,8 @@ StringRef BraceTargetMachine::getSdagABIName() const {
     return BraceSdagLeafHomeABIName;
   case SdagABIKind::DirectCall:
     return BraceSdagDirectCallABIName;
+  case SdagABIKind::DirectCallHome:
+    return BraceSdagDirectCallHomeABIName;
   }
   llvm_unreachable("unknown Brace SelectionDAG ABI");
 }
@@ -173,9 +181,11 @@ BraceTargetMachine::createMCStreamer(raw_pwrite_stream &Out,
         "brace64 SelectionDAG profiles only admit target-local S2 object "
         "emission");
 
-  const Brace::S2ObjectMode Mode = usesSdagDirectCallABI()
-                                       ? Brace::S2ObjectMode::DirectCall
-                                       : Brace::S2ObjectMode::Legacy;
+  Brace::S2ObjectMode Mode = Brace::S2ObjectMode::Legacy;
+  if (usesSdagDirectCallABI())
+    Mode = Brace::S2ObjectMode::DirectCall;
+  else if (usesSdagDirectCallHomeABI())
+    Mode = Brace::S2ObjectMode::DirectCallHome;
   std::unique_ptr<MCObjectWriter> Writer =
       Brace::createS2ObjectWriter(Out, Mode);
   MCStreamer *Streamer = getTarget().createMCObjectStreamer(

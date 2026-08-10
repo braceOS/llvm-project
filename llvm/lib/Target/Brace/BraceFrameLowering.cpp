@@ -13,8 +13,9 @@ using namespace llvm;
 namespace {
 
 bool usesSpillHomes(const MachineFunction &MF) {
-  return MF.getTarget().Options.MCOptions.getABIName() ==
-         BraceSdagLeafHomeABIName;
+  const StringRef ABI = MF.getTarget().Options.MCOptions.getABIName();
+  return ABI == BraceSdagLeafHomeABIName ||
+         ABI == BraceSdagDirectCallHomeABIName;
 }
 
 bool hasOnlyDeadSpillObjects(const MachineFrameInfo &Frame) {

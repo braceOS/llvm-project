@@ -36,7 +36,23 @@ namespace {
   report_fatal_error("brace64 S3b.4 post-home frame verifier: " + Message);
 }
 
-bool hasCanonicalPrePEIFrameState(const MachineFrameInfo &Frame) {
+bool isDirectCallHomeABI(const MachineFunction &MF) {
+  return MF.getTarget().Options.MCOptions.getABIName() ==
+         BraceSdagDirectCallHomeABIName;
+}
+
+bool isSpillHomeABI(const MachineFunction &MF) {
+  const StringRef ABI = MF.getTarget().Options.MCOptions.getABIName();
+  return ABI == BraceSdagLeafHomeABIName ||
+         ABI == BraceSdagDirectCallHomeABIName;
+}
+
+bool expectedHasCalls(const MachineFunction &MF) {
+  return isDirectCallHomeABI(MF) && MF.getName() == "brace_system_entry";
+}
+
+bool hasCanonicalPrePEIFrameState(const MachineFrameInfo &Frame,
+                                  bool HasCalls) {
   return Frame.getStackSize() == 0 && Frame.getNumFixedObjects() == 0 &&
          !Frame.hasVarSizedObjects() && !Frame.hasStackProtectorIndex() &&
          !Frame.hasFunctionContextIndex() && Frame.getOffsetAdjustment() == 0 &&
@@ -49,7 +65,7 @@ bool hasCanonicalPrePEIFrameState(const MachineFrameInfo &Frame) {
          Frame.getLocalFrameMaxAlign() == Align(1) &&
          !Frame.getUseLocalStackAllocationBlock() &&
          Frame.getSavePoints().empty() && Frame.getRestorePoints().empty() &&
-         Frame.getUnsafeStackSize() == 0 && !Frame.hasCalls() &&
+         Frame.getUnsafeStackSize() == 0 && Frame.hasCalls() == HasCalls &&
          !Frame.isFrameAddressTaken() && !Frame.isReturnAddressTaken() &&
          !Frame.hasStackMap() && !Frame.hasPatchPoint() &&
          !Frame.adjustsStack() && !Frame.hasOpaqueSPAdjustment() &&
@@ -155,12 +171,11 @@ public:
   BraceFinalizeSpillHomesLegacy() : MachineFunctionPass(ID) {}
 
   bool runOnMachineFunction(MachineFunction &MF) override {
-    if (MF.getTarget().Options.MCOptions.getABIName() !=
-        BraceSdagLeafHomeABIName)
+    if (!isSpillHomeABI(MF))
       reject("pass ran outside its exact codegen profile");
 
     MachineFrameInfo &Frame = MF.getFrameInfo();
-    if (!hasCanonicalPrePEIFrameState(Frame))
+    if (!hasCanonicalPrePEIFrameState(Frame, expectedHasCalls(MF)))
       reject("non-spill stack, frame, or call state is forbidden");
 
     DenseMap<int, SpillInfo> Spills;
@@ -199,6 +214,19 @@ public:
     llvm::sort(Ordered);
     if (Ordered.size() > 20)
       reject("typed spill-home count exceeds r6..r25");
+    if (isDirectCallHomeABI(MF)) {
+      if (MF.getName() == "brace_system_entry") {
+        if (Ordered.size() > 1 ||
+            (!Ordered.empty() &&
+             Spills.find(Ordered.front())->second.Kind != HomeKind::I32))
+          reject("S3b.6 root permits H0 or exactly one i32 call-live home");
+      } else if (MF.getName() == "brace_system_call_leaf") {
+        if (!Ordered.empty())
+          reject("S3b.6 helper requires an empty home set");
+      } else {
+        reject("S3b.6 encountered an unexpected MachineFunction");
+      }
+    }
 
     DenseMap<int, uint8_t> HomeByFrameIndex;
     for (unsigned Index = 0; Index != Ordered.size(); ++Index)
@@ -262,12 +290,11 @@ public:
   BraceVerifyPostHomeFrameLegacy() : MachineFunctionPass(ID) {}
 
   bool runOnMachineFunction(MachineFunction &MF) override {
-    if (MF.getTarget().Options.MCOptions.getABIName() !=
-        BraceSdagLeafHomeABIName)
+    if (!isSpillHomeABI(MF))
       rejectPostHome("pass ran outside its exact codegen profile");
 
     const MachineFrameInfo &Frame = MF.getFrameInfo();
-    if (!hasCanonicalPrePEIFrameState(Frame))
+    if (!hasCanonicalPrePEIFrameState(Frame, expectedHasCalls(MF)))
       rejectPostHome("noncanonical pre-PEI frame state is forbidden");
     for (int FI = Frame.getObjectIndexBegin(); FI != Frame.getObjectIndexEnd();
          ++FI)

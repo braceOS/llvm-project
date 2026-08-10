@@ -15,8 +15,9 @@ using namespace llvm;
 BraceTargetLowering::BraceTargetLowering(const BraceTargetMachine &TM,
                                          const BraceSubtarget &STI)
     : TargetLowering(TM, STI),
-      DirectCallABI(TM.Options.MCOptions.getABIName() ==
-                    BraceSdagDirectCallABIName) {
+      DirectCallABI(
+          TM.Options.MCOptions.getABIName() == BraceSdagDirectCallABIName ||
+          TM.Options.MCOptions.getABIName() == BraceSdagDirectCallHomeABIName) {
   addRegisterClass(MVT::i8, &Brace::I8RegsRegClass);
   addRegisterClass(MVT::i32, &Brace::I32RegsRegClass);
   addRegisterClass(MVT::i64, &Brace::PAddrRegsRegClass);

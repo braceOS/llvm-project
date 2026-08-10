@@ -38,6 +38,15 @@ constexpr StringLiteral RequiredDataLayout =
   report_fatal_error("brace64 S3b.5 direct-call ABI: " + Message);
 }
 
+[[noreturn]] void rejectDirectHome(const Twine &Message) {
+  report_fatal_error("brace64 S3b.6 direct-call-home ABI: " + Message);
+}
+
+bool isDirectCallABIName(StringRef ABI) {
+  return ABI == BraceSdagDirectCallABIName ||
+         ABI == BraceSdagDirectCallHomeABIName;
+}
+
 bool metadataI32Equals(const Metadata *MD, uint32_t Expected) {
   const auto *Wrapped = dyn_cast_or_null<ConstantAsMetadata>(MD);
   const auto *Integer =
@@ -560,7 +569,8 @@ struct DirectCounts final {
 };
 
 DirectCounts checkDirectFunction(const Function &F, const Function &Helper,
-                                 bool IsHelper, bool HasPhysicalEffects) {
+                                 bool IsHelper, bool HasPhysicalEffects,
+                                 bool AllowsCallLiveHome = false) {
   checkDirectFunctionHeader(F, IsHelper, HasPhysicalEffects);
   if (F.empty() || F.size() > 4)
     rejectDirect("basic-block count is outside 1..4");
@@ -733,12 +743,27 @@ DirectCounts checkDirectFunction(const Function &F, const Function &Helper,
           rejectDirect("CFG cannot be partitioned around the direct call");
       }
     }
+    SmallPtrSet<const Instruction *, 2> CallLiveValues;
+    unsigned CallLiveUses = 0;
     for (const Instruction *I : BeforeCall)
       for (const User *U : I->users()) {
         const auto *Use = dyn_cast<Instruction>(U);
-        if (Use && AfterCall.contains(Use))
+        if (!Use || !AfterCall.contains(Use))
+          continue;
+        if (!AllowsCallLiveHome)
           rejectDirect("caller SSA value remains live across the call");
+        const auto *Load = dyn_cast<LoadInst>(I);
+        if (!Load || !Load->getType()->isIntegerTy(32))
+          rejectDirectHome(
+              "call-live home must originate from one i32 physical load");
+        CallLiveValues.insert(I);
+        ++CallLiveUses;
       }
+    if (AllowsCallLiveHome &&
+        (CallLiveValues.size() > 1 || CallLiveUses != CallLiveValues.size()))
+      rejectDirectHome(
+          "root permits H0 or exactly one i32 SSA value with one post-call "
+          "use");
     for (const User *U : Counts.Call->users()) {
       const auto *Use = dyn_cast<Instruction>(U);
       if (!Use || !AfterCall.contains(Use))
@@ -749,7 +774,7 @@ DirectCounts checkDirectFunction(const Function &F, const Function &Helper,
 }
 
 void checkModuleEnvelope(const Module &M, StringRef RequiredABI) {
-  const bool DirectCall = RequiredABI == BraceSdagDirectCallABIName;
+  const bool DirectCall = isDirectCallABIName(RequiredABI);
   if (M.getTargetTriple().str() != RequiredTriple ||
       M.getDataLayoutStr() != RequiredDataLayout) {
     if (DirectCall)
@@ -811,7 +836,7 @@ public:
 
 void llvm::verifyBraceS3IRModule(const Module &M, StringRef RequiredABI) {
   checkModuleEnvelope(M, RequiredABI);
-  if (RequiredABI == BraceSdagDirectCallABIName) {
+  if (isDirectCallABIName(RequiredABI)) {
     const Function *Entry = M.getFunction("brace_system_entry");
     const Function *Helper = M.getFunction("brace_system_call_leaf");
     if (!Entry || !Helper)
@@ -823,9 +848,10 @@ void llvm::verifyBraceS3IRModule(const Module &M, StringRef RequiredABI) {
         rejectDirect("helper address escapes the single direct call");
     }
     const bool HelperPhysical = hasDirectPhysicalMemory(*Helper);
-    const DirectCounts EntryCounts =
-        checkDirectFunction(*Entry, *Helper, false,
-                            hasDirectPhysicalMemory(*Entry) || HelperPhysical);
+    const bool DirectCallHome = RequiredABI == BraceSdagDirectCallHomeABIName;
+    const DirectCounts EntryCounts = checkDirectFunction(
+        *Entry, *Helper, false,
+        hasDirectPhysicalMemory(*Entry) || HelperPhysical, DirectCallHome);
     const DirectCounts HelperCounts =
         checkDirectFunction(*Helper, *Helper, true, HelperPhysical);
     if (EntryCounts.Instructions + HelperCounts.Instructions > 199 ||
@@ -841,7 +867,7 @@ void llvm::verifyBraceS3IRModule(const Module &M, StringRef RequiredABI) {
 void llvm::verifyBraceS3LateModuleEnvelope(const Module &M,
                                            StringRef RequiredABI) {
   checkModuleEnvelope(M, RequiredABI);
-  if (RequiredABI == BraceSdagDirectCallABIName) {
+  if (isDirectCallABIName(RequiredABI)) {
     const Function *Entry = M.getFunction("brace_system_entry");
     const Function *Helper = M.getFunction("brace_system_call_leaf");
     if (!Entry || !Helper)

@@ -27,16 +27,18 @@ class BraceAsmPrinter final : public AsmPrinter {
   DenseMap<const MachineBasicBlock *, uint32_t> BlockStarts;
   bool AllowsHomes;
   bool DirectCall;
+  bool DirectCallHome;
 
 public:
   static char ID;
 
   BraceAsmPrinter(TargetMachine &TM, std::unique_ptr<MCStreamer> Streamer)
       : AsmPrinter(TM, std::move(Streamer), ID),
-        AllowsHomes(
-            static_cast<BraceTargetMachine &>(TM).usesSdagLeafHomeABI()),
-        DirectCall(
-            static_cast<BraceTargetMachine &>(TM).usesSdagDirectCallABI()) {}
+        AllowsHomes(static_cast<BraceTargetMachine &>(TM).usesSdagSpillHomes()),
+        DirectCall(static_cast<BraceTargetMachine &>(TM).usesSdagDirectCalls()),
+        DirectCallHome(
+            static_cast<BraceTargetMachine &>(TM).usesSdagDirectCallHomeABI()) {
+  }
 
   StringRef getPassName() const override {
     return "Brace S3b.3 S2 Assembly Printer";
@@ -67,7 +69,9 @@ bool BraceAsmPrinter::doInitialization(Module &M) {
   // module asm, so recheck the direct-call module envelope before delegating
   // and before any untrusted module-level payload reaches MC.
   if (DirectCall)
-    verifyBraceS3LateModuleEnvelope(M, BraceSdagDirectCallABIName);
+    verifyBraceS3LateModuleEnvelope(M, DirectCallHome
+                                           ? BraceSdagDirectCallHomeABIName
+                                           : BraceSdagDirectCallABIName);
   return AsmPrinter::doInitialization(M);
 }
 
@@ -266,7 +270,9 @@ bool BraceAsmPrinter::runOnMachineFunction(MachineFunction &Function) {
   SetupMachineFunction(Function);
   if (DirectCall)
     verifyBraceS3FinalMachineFunctionEnvelope(
-        Function, AllowsHomes, DirectCall, BraceSdagDirectCallABIName);
+        Function, AllowsHomes, DirectCall,
+        DirectCallHome ? BraceSdagDirectCallHomeABIName
+                       : BraceSdagDirectCallABIName);
   BlockStarts.clear();
 
   uint32_t Operation = 0;

@@ -83,6 +83,7 @@ constexpr uint64_t DirectFunctionSize = 64;
 constexpr uint64_t DirectDescriptorSize = 24;
 constexpr uint64_t DirectSectionCount = 11;
 constexpr uint32_t DirectExperimentalFlags = UINT32_C(0x42520200);
+constexpr uint32_t DirectHomeExperimentalFlags = UINT32_C(0x42520300);
 
 constexpr char DirectSectionNames[] =
     "\0.brace.target\0.brace.functions\0.brace.types\0.brace.literals\0"
@@ -756,7 +757,7 @@ Error S2ObjectWriter::writeExact(ArrayRef<uint8_t> RegisterTypes,
 Error S2ObjectWriter::writeDirectCallExact(ArrayRef<S2DirectFunction> Functions,
                                            uint32_t EntryFunction,
                                            uint64_t RelocationBase) {
-  if (Mode != S2ObjectMode::DirectCall)
+  if (Mode != S2ObjectMode::DirectCall && Mode != S2ObjectMode::DirectCallHome)
     return fail("direct-call write used with the legacy writer mode");
   if (Functions.size() != 2 || EntryFunction != 0 || !Functions[0].Present ||
       !Functions[1].Present)
@@ -764,9 +765,19 @@ Error S2ObjectWriter::writeDirectCallExact(ArrayRef<S2DirectFunction> Functions,
 
   constexpr std::array<uint8_t, 6> RequiredTypes{PADDR, PADDR, I8,
                                                  I8,    I32,   I32};
-  if (Functions[0].RegisterTypes != ArrayRef<uint8_t>(RequiredTypes) ||
-      Functions[1].RegisterTypes != ArrayRef<uint8_t>(RequiredTypes) ||
-      !Functions[0].ParameterSlots.empty() || Functions[0].ResultKind != 0 ||
+  constexpr std::array<uint8_t, 7> RequiredHomeTypes{PADDR, PADDR, I8, I8,
+                                                     I32,   I32,   I32};
+  const bool DirectCallHome = Mode == S2ObjectMode::DirectCallHome;
+  const bool ExactTypes =
+      DirectCallHome
+          ? (Functions[0].RegisterTypes == ArrayRef<uint8_t>(RequiredTypes) ||
+             Functions[0].RegisterTypes ==
+                 ArrayRef<uint8_t>(RequiredHomeTypes)) &&
+                Functions[1].RegisterTypes == ArrayRef<uint8_t>(RequiredTypes)
+          : Functions[0].RegisterTypes == ArrayRef<uint8_t>(RequiredTypes) &&
+                Functions[1].RegisterTypes == ArrayRef<uint8_t>(RequiredTypes);
+  if (!ExactTypes || !Functions[0].ParameterSlots.empty() ||
+      Functions[0].ResultKind != 0 ||
       Functions[1].ParameterSlots != ArrayRef<uint8_t>({4}) ||
       Functions[1].ResultKind != 2)
     return fail("direct-call functions do not have the exact S3b.5 signature");
@@ -867,6 +878,11 @@ Error S2ObjectWriter::writeDirectCallExact(ArrayRef<S2DirectFunction> Functions,
               Function.RegisterTypes[Register] == I32 ||
               Function.RegisterTypes[Register] == I64);
     };
+    auto IsResident = [](uint64_t Register) { return Register < 6; };
+    auto IsHome = [&](uint64_t Register) {
+      return DirectCallHome && FunctionIndex == 0 && Register >= 6 &&
+             Register < Function.RegisterTypes.size();
+    };
     const unsigned FunctionSize = Function.Instructions.size();
     if (Function.BlockStarts.empty() || Function.BlockStarts.front() != 0 ||
         Function.Entry != 0 || Function.BlockStarts.back() >= FunctionSize)
@@ -882,11 +898,18 @@ Error S2ObjectWriter::writeDirectCallExact(ArrayRef<S2DirectFunction> Functions,
     };
     SmallVector<uint32_t, 128> ReadMasks(FunctionSize, 0);
     SmallVector<uint32_t, 128> DefinitionMasks(FunctionSize, 0);
+    SmallVector<uint32_t, 128> DerivedInputMasks(FunctionSize, 0);
+    SmallVector<uint32_t, 128> SaveReadMasks(FunctionSize, 0);
+    SmallVector<uint32_t, 128> RestoreDefinitionMasks(FunctionSize, 0);
+    SmallVector<uint32_t, 128> PhysicalLoadDefinitionMasks(FunctionSize, 0);
+    SmallVector<uint32_t, 128> ObservableReadMasks(FunctionSize, 0);
     SmallVector<bool, 128> CallTransfers(FunctionSize, false);
     SmallVector<bool, 128> Terminators(FunctionSize, false);
     SmallVector<SmallVector<unsigned, 2>, 128> Successors(FunctionSize);
     SmallVector<SmallVector<unsigned, 4>, 128> Predecessors(FunctionSize);
     std::optional<unsigned> CallOperation;
+    std::optional<unsigned> SaveOperation;
+    std::optional<unsigned> RestoreOperation;
     unsigned ReturnCount = 0;
 
     auto Read = [&](unsigned OperationIndex, uint64_t Register) -> Error {
@@ -927,6 +950,8 @@ Error S2ObjectWriter::writeDirectCallExact(ArrayRef<S2DirectFunction> Functions,
         const uint64_t Mask = integerMask(*Kind);
         if (Mask == 0 || !HasType(*Destination, *Kind) || (*Value & ~Mask) != 0)
           return fail("invalid direct-call Constant operands");
+        if (DirectCallHome && !IsResident(*Destination))
+          return fail("direct-call home is referenced by Constant");
         const unsigned LiteralIndex = literalIndex(Literals, {false, *Value});
         if (LiteralIndex >= 4096)
           return fail("direct-call Constant literal index overflow");
@@ -949,6 +974,32 @@ Error S2ObjectWriter::writeDirectCallExact(ArrayRef<S2DirectFunction> Functions,
             !HasType(*Left, Function.RegisterTypes[*Destination]) ||
             !HasType(*Right, Function.RegisterTypes[*Destination]))
           return fail("invalid direct-call IntegerAnd register types");
+        if (DirectCallHome) {
+          const bool ResidentOnly = IsResident(*Destination) &&
+                                    IsResident(*Left) && IsResident(*Right);
+          const bool Save =
+              IsHome(*Destination) && IsResident(*Left) && *Left == *Right;
+          const bool Restore =
+              IsResident(*Destination) && IsHome(*Left) && *Left == *Right;
+          if (!ResidentOnly && !Save && !Restore)
+            return fail("direct-call home IntegerAnd is not a canonical copy");
+          if (Save) {
+            if (SaveOperation)
+              return fail("direct-call home is saved more than once");
+            SaveOperation = OperationIndex;
+            SaveReadMasks[OperationIndex] = UINT32_C(1) << *Left;
+          }
+          if (Restore) {
+            if (RestoreOperation)
+              return fail("direct-call home is restored more than once");
+            RestoreOperation = OperationIndex;
+            RestoreDefinitionMasks[OperationIndex] = UINT32_C(1)
+                                                     << *Destination;
+          }
+          if (ResidentOnly)
+            DerivedInputMasks[OperationIndex] =
+                (UINT32_C(1) << *Left) | (UINT32_C(1) << *Right);
+        }
         if (Error E = Read(OperationIndex, *Left))
           return E;
         if (Error E = Read(OperationIndex, *Right))
@@ -974,6 +1025,8 @@ Error S2ObjectWriter::writeDirectCallExact(ArrayRef<S2DirectFunction> Functions,
             Position - FunctionDescriptors[FunctionIndex].begin());
         const uint8_t Result = (*Descriptor)[4];
         const uint8_t Argument = (*Descriptor)[8];
+        if (DirectCallHome && (!IsResident(Result) || !IsResident(Argument)))
+          return fail("direct-call home is used by Call");
         if (Error E = Read(OperationIndex, Argument))
           return E;
         if (Error E = Define(OperationIndex, Result))
@@ -1009,6 +1062,8 @@ Error S2ObjectWriter::writeDirectCallExact(ArrayRef<S2DirectFunction> Functions,
               joinErrors(TrueTarget.takeError(), FalseTarget.takeError()));
         if (!HasIntegerType(*Condition) || *TrueTarget == *FalseTarget)
           return fail("invalid direct-call BranchIf operands");
+        if (DirectCallHome && !IsResident(*Condition))
+          return fail("direct-call home is used by BranchIf");
         if (!IsBlockStart(*TrueTarget) || !IsBlockStart(*FalseTarget))
           return fail("direct-call branch target is not a block start");
         if (Error E = Read(OperationIndex, *Condition))
@@ -1038,6 +1093,8 @@ Error S2ObjectWriter::writeDirectCallExact(ArrayRef<S2DirectFunction> Functions,
           return Value.takeError();
         if (FunctionIndex != 1 || !HasType(*Value, I32))
           return fail("valued Return is outside the i32 leaf terminator");
+        if (DirectCallHome && !IsResident(*Value))
+          return fail("direct-call home is used by Return");
         if (Error E = Read(OperationIndex, *Value))
           return E;
         Payload = static_cast<uint32_t>(*Value | (UINT64_C(1) << 5));
@@ -1054,6 +1111,8 @@ Error S2ObjectWriter::writeDirectCallExact(ArrayRef<S2DirectFunction> Functions,
           return joinErrors(Destination.takeError(), Address.takeError());
         if (!HasType(*Destination, PADDR))
           return fail("invalid direct-call PhysicalAddress destination");
+        if (DirectCallHome && !IsResident(*Destination))
+          return fail("direct-call home is referenced by PhysicalAddress");
         const unsigned LiteralIndex = literalIndex(Literals, {true, *Address});
         if (LiteralIndex >= 4096)
           return fail("direct-call PhysicalAddress literal index overflow");
@@ -1078,12 +1137,18 @@ Error S2ObjectWriter::writeDirectCallExact(ArrayRef<S2DirectFunction> Functions,
         if ((*Width != U8 && *Width != U32) ||
             !HasType(*Destination, ExpectedType) || !HasType(*Address, PADDR))
           return fail("invalid direct-call PhysicalLoad operands");
+        if (DirectCallHome &&
+            (!IsResident(*Destination) || !IsResident(*Address)))
+          return fail("direct-call home is referenced by PhysicalLoad");
         if (Error E = Read(OperationIndex, *Address))
           return E;
         Payload = static_cast<uint32_t>(*Destination | (*Width << 5) |
                                         (*Address << 6));
         if (Error E = Define(OperationIndex, *Destination))
           return E;
+        if (DirectCallHome && *Width == U32)
+          PhysicalLoadDefinitionMasks[OperationIndex] = UINT32_C(1)
+                                                        << *Destination;
         break;
       }
       case S2_PHYSICAL_STORE: {
@@ -1102,10 +1167,14 @@ Error S2ObjectWriter::writeDirectCallExact(ArrayRef<S2DirectFunction> Functions,
         if ((*Width != U8 && *Width != U32) || !HasType(*Address, PADDR) ||
             !HasType(*Source, ExpectedType))
           return fail("invalid direct-call PhysicalStore operands");
+        if (DirectCallHome && (!IsResident(*Address) || !IsResident(*Source)))
+          return fail("direct-call home is referenced by PhysicalStore");
         if (Error E = Read(OperationIndex, *Address))
           return E;
         if (Error E = Read(OperationIndex, *Source))
           return E;
+        if (DirectCallHome)
+          ObservableReadMasks[OperationIndex] = UINT32_C(1) << *Source;
         Payload =
             static_cast<uint32_t>(*Width | (*Address << 1) | (*Source << 6));
         break;
@@ -1129,6 +1198,15 @@ Error S2ObjectWriter::writeDirectCallExact(ArrayRef<S2DirectFunction> Functions,
 
     if (ReturnCount == 0)
       return fail("direct-call function has no Return");
+    if (DirectCallHome && FunctionIndex == 0) {
+      const bool H1 = Function.RegisterTypes.size() == RequiredHomeTypes.size();
+      if (H1 && (!CallOperation || !SaveOperation || !RestoreOperation ||
+                 *SaveOperation + 1 != *CallOperation ||
+                 *CallOperation + 1 != *RestoreOperation))
+        return fail("direct-call H1 save/Call/restore placement is not exact");
+      if (!H1 && (SaveOperation || RestoreOperation))
+        return fail("direct-call H0 contains a home transfer");
+    }
 
     // The streamer carries the actual non-debug MachineBasicBlock boundaries
     // as target-private transient metadata.  Independently validate those
@@ -1189,6 +1267,8 @@ Error S2ObjectWriter::writeDirectCallExact(ArrayRef<S2DirectFunction> Functions,
     SmallVector<uint32_t, 128> In(FunctionSize, AllRegisters);
     SmallVector<uint32_t, 128> Out(FunctionSize, AllRegisters);
     auto Transfer = [&](unsigned OperationIndex, uint32_t State) {
+      if (CallTransfers[OperationIndex] && DirectCallHome)
+        return (State & ~UINT32_C(0x3f)) | DefinitionMasks[OperationIndex];
       if (CallTransfers[OperationIndex])
         return DefinitionMasks[OperationIndex];
       return State | DefinitionMasks[OperationIndex];
@@ -1223,6 +1303,91 @@ Error S2ObjectWriter::writeDirectCallExact(ArrayRef<S2DirectFunction> Functions,
          ++OperationIndex)
       if ((ReadMasks[OperationIndex] & ~In[OperationIndex]) != 0)
         return fail("direct-call register is read before definition");
+
+    if (DirectCallHome && FunctionIndex == 0 && RestoreOperation) {
+      struct HomeFlowState {
+        uint32_t Tainted = 0;
+        uint32_t LoadDerived = 0;
+        bool Observed = false;
+        bool SavedLoad = false;
+
+        bool operator==(const HomeFlowState &Other) const {
+          return Tainted == Other.Tainted && LoadDerived == Other.LoadDerived &&
+                 Observed == Other.Observed && SavedLoad == Other.SavedLoad;
+        }
+      };
+      auto TransferHomeFlow = [&](unsigned OperationIndex,
+                                  HomeFlowState State) {
+        if ((ObservableReadMasks[OperationIndex] & State.Tainted) != 0)
+          State.Observed = true;
+        if ((SaveReadMasks[OperationIndex] & State.LoadDerived) != 0)
+          State.SavedLoad = true;
+        uint32_t ResultTaint = 0;
+        uint32_t ResultLoadDerived = 0;
+        if ((DerivedInputMasks[OperationIndex] & State.Tainted) != 0)
+          ResultTaint = DefinitionMasks[OperationIndex];
+        if ((DerivedInputMasks[OperationIndex] & State.LoadDerived) != 0)
+          ResultLoadDerived = DefinitionMasks[OperationIndex];
+        State.Tainted &= ~DefinitionMasks[OperationIndex];
+        State.Tainted |= ResultTaint;
+        State.LoadDerived &= ~DefinitionMasks[OperationIndex];
+        State.LoadDerived |= ResultLoadDerived;
+        State.LoadDerived |= PhysicalLoadDefinitionMasks[OperationIndex];
+        State.Tainted |= RestoreDefinitionMasks[OperationIndex];
+        if (CallTransfers[OperationIndex]) {
+          State.Tainted &= ~UINT32_C(0x3f);
+          State.LoadDerived &= ~UINT32_C(0x3f);
+        }
+        return State;
+      };
+
+      constexpr HomeFlowState Universal{UINT32_C(0x3f), UINT32_C(0x3f), true,
+                                        true};
+      SmallVector<HomeFlowState, 128> FlowIn(FunctionSize, Universal);
+      SmallVector<HomeFlowState, 128> FlowOut(FunctionSize, Universal);
+      FlowIn[Function.Entry] = {};
+      FlowOut[Function.Entry] = TransferHomeFlow(Function.Entry, {});
+      Changed = true;
+      Iterations = 0;
+      while (Changed) {
+        if (++Iterations > 512)
+          return fail("direct-call restored-home flow did not converge");
+        Changed = false;
+        for (unsigned OperationIndex = 0; OperationIndex != FunctionSize;
+             ++OperationIndex) {
+          HomeFlowState NewIn{};
+          if (OperationIndex != Function.Entry) {
+            NewIn = Universal;
+            if (Predecessors[OperationIndex].empty())
+              return fail("direct-call non-entry operation has no predecessor");
+            for (unsigned Predecessor : Predecessors[OperationIndex]) {
+              NewIn.Tainted &= FlowOut[Predecessor].Tainted;
+              NewIn.LoadDerived &= FlowOut[Predecessor].LoadDerived;
+              NewIn.Observed = NewIn.Observed && FlowOut[Predecessor].Observed;
+              NewIn.SavedLoad =
+                  NewIn.SavedLoad && FlowOut[Predecessor].SavedLoad;
+            }
+          }
+          const HomeFlowState NewOut = TransferHomeFlow(OperationIndex, NewIn);
+          if (!(FlowIn[OperationIndex] == NewIn) ||
+              !(FlowOut[OperationIndex] == NewOut)) {
+            FlowIn[OperationIndex] = NewIn;
+            FlowOut[OperationIndex] = NewOut;
+            Changed = true;
+          }
+        }
+      }
+      for (unsigned OperationIndex = 0; OperationIndex != FunctionSize;
+           ++OperationIndex)
+        if (Function.Instructions[OperationIndex].getOpcode() == S2_RETURN &&
+            (!FlowOut[OperationIndex].SavedLoad ||
+             !FlowOut[OperationIndex].Observed))
+          return fail(!FlowOut[OperationIndex].SavedLoad
+                          ? "saved home does not originate from a physical "
+                            "i32 load"
+                          : "restored home does not reach an observable "
+                            "physical store");
+    }
 
     if (FunctionIndex == 0 && CallOperation) {
       SmallVector<bool, 128> BeforeCall(FunctionSize, false);
@@ -1337,7 +1502,9 @@ Error S2ObjectWriter::writeDirectCallExact(ArrayRef<S2DirectFunction> Functions,
   storeU16(Bytes, 18, ExperimentalMachine);
   storeU32(Bytes, 20, 1);
   storeU64(Bytes, 40, L.SectionHeadersOffset);
-  storeU32(Bytes, 48, DirectExperimentalFlags);
+  storeU32(Bytes, 48,
+           DirectCallHome ? DirectHomeExperimentalFlags
+                          : DirectExperimentalFlags);
   storeU16(Bytes, 52, 64);
   storeU16(Bytes, 58, 64);
   storeU16(Bytes, 60, DirectSectionCount);
