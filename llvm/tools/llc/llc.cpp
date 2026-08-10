@@ -617,7 +617,8 @@ static int compileModule(char **argv, SmallVectorImpl<PassPlugin> &PluginList,
       }
 
       InitializeOptions(TheTriple);
-      if (Options.MCOptions.getABIName() == "brace-system-s2-leaf-r0" &&
+      if ((Options.MCOptions.getABIName() == "brace-system-s2-leaf-r0" ||
+           Options.MCOptions.getABIName() == "brace-system-s2-leaf-home-r0") &&
           (Triple::normalize(DataLayoutTargetTriple) !=
                "brace64-unknown-none-elf" ||
            OldDLStr != "e-m:e-p:64:64-i64:64-i128:128-n32:64-S128")) {

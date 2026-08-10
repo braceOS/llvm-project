@@ -67,7 +67,8 @@ public:
   StringRef getABI() const override { return ABI; }
 
   bool setABI(const std::string &Name) override {
-    if (Name != "brace-system-s2-leaf-r0")
+    if (Name != "brace-system-s2-leaf-r0" &&
+        Name != "brace-system-s2-leaf-home-r0")
       return false;
     ABI = Name;
     return true;

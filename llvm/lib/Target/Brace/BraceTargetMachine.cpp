@@ -34,8 +34,6 @@ using namespace llvm;
 
 namespace {
 
-constexpr StringLiteral SdagLeafABIName = "brace-system-s2-leaf-r0";
-
 class BracePassConfig final : public TargetPassConfig {
 public:
   BracePassConfig(BraceTargetMachine &TM, PassManagerBase &PM)
@@ -65,10 +63,19 @@ public:
   void addMachineLateOptimization() override {}
   void addBlockPlacement() override {}
 
+  void addPostRegAlloc() override {
+    if (getBraceTargetMachine().usesSdagLeafHomeABI())
+      addPass(createBraceFinalizeSpillHomesPass());
+  }
+
   void addPreEmitPass2() override {
-    addPass(createMachineVerifierPass("Before Brace S3b.3 publication"));
-    addPass(createBraceFinalizeBranchesPass());
-    addPass(createMachineVerifierPass("After Brace S3b.3 publication"));
+    const bool Homes = getBraceTargetMachine().usesSdagLeafHomeABI();
+    addPass(createMachineVerifierPass(Homes
+                                          ? "Before Brace S3b.4 publication"
+                                          : "Before Brace S3b.3 publication"));
+    addPass(createBraceFinalizeBranchesPass(getBraceTargetMachine()));
+    addPass(createMachineVerifierPass(Homes ? "After Brace S3b.4 publication"
+                                            : "After Brace S3b.3 publication"));
   }
 };
 
@@ -86,17 +93,34 @@ BraceTargetMachine::BraceTargetMachine(const Target &T, const Triple &TT,
       Subtarget(TT, CPU, FS, *this),
       TLOF(std::make_unique<TargetLoweringObjectFileELF>()) {
   const StringRef ABI = Options.MCOptions.getABIName();
-  SdagLeafABI = ABI == SdagLeafABIName;
+  if (ABI == BraceSdagLeafABIName)
+    SdagABI = SdagABIKind::Leaf;
+  else if (ABI == BraceSdagLeafHomeABIName)
+    SdagABI = SdagABIKind::LeafHome;
   UnsupportedConfiguration =
       (RM && *RM != Reloc::Static) || (CM && *CM != CodeModel::Small) || JIT ||
       OL != CodeGenOptLevel::Less || (!CPU.empty() && CPU != "generic") ||
-      !FS.empty() || (!ABI.empty() && ABI != SdagLeafABIName);
+      !FS.empty() ||
+      (!ABI.empty() && ABI != BraceSdagLeafABIName &&
+       ABI != BraceSdagLeafHomeABIName);
   initAsmInfo();
   setFastISel(false);
   setO0WantsFastISel(false);
 }
 
 BraceTargetMachine::~BraceTargetMachine() = default;
+
+StringRef BraceTargetMachine::getSdagABIName() const {
+  switch (SdagABI) {
+  case SdagABIKind::None:
+    return {};
+  case SdagABIKind::Leaf:
+    return BraceSdagLeafABIName;
+  case SdagABIKind::LeafHome:
+    return BraceSdagLeafHomeABIName;
+  }
+  llvm_unreachable("unknown Brace SelectionDAG ABI");
+}
 
 TargetPassConfig *BraceTargetMachine::createPassConfig(PassManagerBase &PM) {
   return new BracePassConfig(*this, PM);
@@ -108,7 +132,7 @@ bool BraceTargetMachine::addPassesToEmitFile(
     MachineModuleInfoWrapperPass *MMIWP) {
   if (DwoOut || DisableVerify || UnsupportedConfiguration)
     return true;
-  if (SdagLeafABI) {
+  if (usesSdagABI()) {
     if (FileType != CodeGenFileType::ObjectFile)
       return true;
     return CodeGenTargetMachineImpl::addPassesToEmitFile(
@@ -133,7 +157,7 @@ Expected<std::unique_ptr<MCStreamer>>
 BraceTargetMachine::createMCStreamer(raw_pwrite_stream &Out,
                                      raw_pwrite_stream *DwoOut,
                                      CodeGenFileType FileType, MCContext &Ctx) {
-  if (!SdagLeafABI || DwoOut || FileType != CodeGenFileType::ObjectFile)
+  if (!usesSdagABI() || DwoOut || FileType != CodeGenFileType::ObjectFile)
     return createStringError(
         "brace64 S3b.3 only admits target-local S2 object emission");
 
@@ -150,5 +174,6 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeBraceTarget() {
   RegisterTargetMachine<BraceTargetMachine> X(getTheBraceTarget());
   PassRegistry &PR = *PassRegistry::getPassRegistry();
   initializeBraceDAGToDAGISelLegacyPass(PR);
+  initializeBraceFinalizeSpillHomesLegacyPass(PR);
   initializeBraceFinalizeBranchesLegacyPass(PR);
 }

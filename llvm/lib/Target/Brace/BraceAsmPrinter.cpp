@@ -13,6 +13,9 @@
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/Error.h"
+#include <algorithm>
+#include <array>
+#include <optional>
 
 using namespace llvm;
 
@@ -22,12 +25,15 @@ namespace {
 
 class BraceAsmPrinter final : public AsmPrinter {
   DenseMap<const MachineBasicBlock *, uint32_t> BlockStarts;
+  bool AllowsHomes;
 
 public:
   static char ID;
 
   BraceAsmPrinter(TargetMachine &TM, std::unique_ptr<MCStreamer> Streamer)
-      : AsmPrinter(TM, std::move(Streamer), ID) {}
+      : AsmPrinter(TM, std::move(Streamer), ID),
+        AllowsHomes(
+            static_cast<BraceTargetMachine &>(TM).usesSdagLeafHomeABI()) {}
 
   StringRef getPassName() const override {
     return "Brace S3b.3 S2 Assembly Printer";
@@ -43,6 +49,8 @@ private:
   uint32_t blockStart(const MachineBasicBlock *MBB) const;
   void emitS2(const MachineInstr &MI);
   void emitMC(unsigned Opcode, std::initializer_list<uint64_t> Operands);
+  bool collectRegisterTypes(const MachineFunction &MF,
+                            SmallVectorImpl<uint8_t> &Types);
 };
 
 } // namespace
@@ -119,6 +127,14 @@ void BraceAsmPrinter::emitS2(const MachineInstr &MI) {
   case Brace::MOV32:
     emitMC(Brace::S2_INTEGER_AND, {Reg(0), Reg(1), Reg(1)});
     return;
+  case Brace::HOME_SAVE8:
+  case Brace::HOME_SAVE32:
+    emitMC(Brace::S2_INTEGER_AND, {6 + Imm(0), Reg(1), Reg(1)});
+    return;
+  case Brace::HOME_RESTORE8:
+  case Brace::HOME_RESTORE32:
+    emitMC(Brace::S2_INTEGER_AND, {Reg(0), 6 + Imm(1), 6 + Imm(1)});
+    return;
   case Brace::LOAD8:
     emitMC(Brace::S2_PHYSICAL_LOAD, {Reg(0), Brace::U8, Reg(1)});
     return;
@@ -147,6 +163,73 @@ void BraceAsmPrinter::emitS2(const MachineInstr &MI) {
   }
 }
 
+bool BraceAsmPrinter::collectRegisterTypes(const MachineFunction &MF,
+                                           SmallVectorImpl<uint8_t> &Types) {
+  Types.assign({Brace::PADDR, Brace::PADDR, Brace::I8, Brace::I8, Brace::I32,
+                Brace::I32});
+  if (!AllowsHomes)
+    return true;
+
+  std::array<std::optional<uint8_t>, 20> Homes{};
+  std::optional<unsigned> Maximum;
+  for (const MachineBasicBlock &MBB : MF) {
+    for (const MachineInstr &MI : MBB) {
+      unsigned Operand = 0;
+      uint8_t Type = 0;
+      switch (MI.getOpcode()) {
+      case Brace::HOME_SAVE8:
+        Operand = 0;
+        Type = Brace::I8;
+        break;
+      case Brace::HOME_SAVE32:
+        Operand = 0;
+        Type = Brace::I32;
+        break;
+      case Brace::HOME_RESTORE8:
+        Operand = 1;
+        Type = Brace::I8;
+        break;
+      case Brace::HOME_RESTORE32:
+        Operand = 1;
+        Type = Brace::I32;
+        break;
+      default:
+        continue;
+      }
+      if (!MI.getOperand(Operand).isImm()) {
+        OutContext.reportError(SMLoc(),
+                               "brace64 S3b.4 home operand is not an ordinal");
+        return false;
+      }
+      const int64_t Ordinal = MI.getOperand(Operand).getImm();
+      if (Ordinal < 0 || Ordinal > 19) {
+        OutContext.reportError(SMLoc(),
+                               "brace64 S3b.4 home ordinal is outside 0..19");
+        return false;
+      }
+      const unsigned Index = static_cast<unsigned>(Ordinal);
+      if (Homes[Index] && Homes[Index] != Type) {
+        OutContext.reportError(SMLoc(),
+                               "brace64 S3b.4 home has inconsistent types");
+        return false;
+      }
+      Homes[Index] = Type;
+      Maximum = Maximum ? std::max(*Maximum, Index) : Index;
+    }
+  }
+  if (!Maximum)
+    return true;
+  for (unsigned Index = 0; Index <= *Maximum; ++Index) {
+    if (!Homes[Index]) {
+      OutContext.reportError(SMLoc(),
+                             "brace64 S3b.4 home declaration has a hole");
+      return false;
+    }
+    Types.push_back(*Homes[Index]);
+  }
+  return true;
+}
+
 bool BraceAsmPrinter::runOnMachineFunction(MachineFunction &Function) {
   SetupMachineFunction(Function);
   BlockStarts.clear();
@@ -170,9 +253,9 @@ bool BraceAsmPrinter::runOnMachineFunction(MachineFunction &Function) {
     OutContext.reportError(SMLoc(), "brace64 S3b.3 target streamer is missing");
     return false;
   }
-  const uint8_t RegisterTypes[] = {
-      Brace::PADDR, Brace::PADDR, Brace::I8, Brace::I8, Brace::I32, Brace::I32,
-  };
+  SmallVector<uint8_t, 26> RegisterTypes;
+  if (!collectRegisterTypes(Function, RegisterTypes))
+    return false;
   if (Error E = TargetStreamer->setHeader(RegisterTypes,
                                           blockStart(&Function.front()),
                                           Brace::S2RelocationBase)) {

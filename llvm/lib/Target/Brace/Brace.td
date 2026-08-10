@@ -61,6 +61,8 @@ def BraceImm8 : Operand<i8>;
 def BraceImm32 : Operand<i32>;
 def BraceImm64 : Operand<i64>;
 def BraceMBB : Operand<OtherVT>;
+def BraceFrameIndex : Operand<i64>;
+def BraceHome : Operand<i32>;
 
 class BraceMI<dag outs, dag ins, string mnemonic> : Instruction {
   let Namespace = "Brace";
@@ -75,6 +77,12 @@ def CONST8 : BraceMI<(outs I8Regs:$dst), (ins BraceImm8:$value),
                      "const8 $dst, $value">;
 def CONST32 : BraceMI<(outs I32Regs:$dst), (ins BraceImm32:$value),
                       "const32 $dst, $value">;
+// The descriptor advertises rematerialization so LLVM's allocator can ask the
+// target about it.  BraceInstrInfo keeps the answer ABI-local: this is a pure,
+// duplicable constant only for the S3b.4 spill-home profile, while the frozen
+// S3b.3 profile retains its old register-pressure behavior and instruction
+// ordering.
+let isReMaterializable = 1 in
 def PADDR_IMM : BraceMI<(outs PAddrRegs:$dst), (ins BraceImm64:$address),
                         "paddr $dst, $address">;
 
@@ -88,6 +96,48 @@ let Constraints = "$dst = $left" in {
 def MOV8 : BraceMI<(outs I8Regs:$dst), (ins I8Regs:$src), "mov8 $dst, $src">;
 def MOV32
     : BraceMI<(outs I32Regs:$dst), (ins I32Regs:$src), "mov32 $dst, $src">;
+
+// S3b.4 deliberately lets LLVM model register-allocation pressure with its
+// ordinary private frame-index machinery.  These four pseudos exist only
+// between physical-register rewrite and BraceFinalizeSpillHomes.  They are
+// never publishable S2 operations and never denote Guest memory.
+let isPseudo = 1, mayStore = 1, hasSideEffects = 0 in {
+  def SPILL_STORE8
+      : BraceMI<(outs), (ins I8Regs:$src, BraceFrameIndex:$slot),
+                "spill_store8 $src, $slot">;
+  def SPILL_STORE32
+      : BraceMI<(outs), (ins I32Regs:$src, BraceFrameIndex:$slot),
+                "spill_store32 $src, $slot">;
+}
+
+let isPseudo = 1, mayLoad = 1, hasSideEffects = 0 in {
+  def SPILL_LOAD8
+      : BraceMI<(outs I8Regs:$dst), (ins BraceFrameIndex:$slot),
+                "spill_load8 $dst, $slot">;
+  def SPILL_LOAD32
+      : BraceMI<(outs I32Regs:$dst), (ins BraceFrameIndex:$slot),
+                "spill_load32 $dst, $slot">;
+}
+
+// FI-free semantic-home transfers are the only S3b.4 publication form.  A
+// home ordinal is the zero-based compiler-local h in 0..19, not an LLVM
+// physical register or an S2 slot number.  AsmPrinter alone projects h to
+// S2 r(6+h).  Keep both directions side-effecting so post-RA sinking cannot
+// change architectural fuel/location order.
+let isPseudo = 1, hasSideEffects = 1 in {
+  def HOME_SAVE8
+      : BraceMI<(outs), (ins BraceHome:$home, I8Regs:$src),
+                "home_save8 $home, $src">;
+  def HOME_SAVE32
+      : BraceMI<(outs), (ins BraceHome:$home, I32Regs:$src),
+                "home_save32 $home, $src">;
+  def HOME_RESTORE8
+      : BraceMI<(outs I8Regs:$dst), (ins BraceHome:$home),
+                "home_restore8 $dst, $home">;
+  def HOME_RESTORE32
+      : BraceMI<(outs I32Regs:$dst), (ins BraceHome:$home),
+                "home_restore32 $dst, $home">;
+}
 
 let mayLoad = 1, hasSideEffects = 1 in {
   def LOAD8 : BraceMI<(outs I8Regs:$dst), (ins PAddrRegs:$address),

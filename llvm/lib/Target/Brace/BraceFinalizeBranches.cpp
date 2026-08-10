@@ -3,6 +3,7 @@
 #include "Brace.h"
 #include "BraceInstrInfo.h"
 #include "BraceSubtarget.h"
+#include "BraceTargetMachine.h"
 #include "MCTargetDesc/BraceMCTargetDesc.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
@@ -18,8 +19,10 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/MathExtras.h"
+#include <algorithm>
 #include <array>
 #include <optional>
+#include <string>
 
 using namespace llvm;
 
@@ -155,7 +158,7 @@ void finalizeConditionalBranch(MachineBasicBlock &MBB,
     TrailingBranch->eraseFromParent();
 }
 
-void verifyInstruction(const MachineInstr &MI) {
+void verifyInstruction(const MachineInstr &MI, bool AllowsHomes) {
   verifyInstructionEnvelope(MI);
 
   auto requireReg = [&](unsigned Index, bool (*Predicate)(Register), bool IsDef,
@@ -173,6 +176,12 @@ void verifyInstruction(const MachineInstr &MI) {
   auto requireImm = [&](unsigned Index) {
     if (Index >= MI.getNumExplicitOperands() || !MI.getOperand(Index).isImm())
       reject("instruction has a malformed immediate operand");
+  };
+  auto requireHome = [&](unsigned Index) {
+    requireImm(Index);
+    const int64_t Home = MI.getOperand(Index).getImm();
+    if (Home < 0 || Home > 19)
+      reject("semantic-home ordinal is outside 0..19");
   };
   auto requireCount = [&](unsigned Count) {
     if (MI.getNumExplicitOperands() != Count)
@@ -241,6 +250,34 @@ void verifyInstruction(const MachineInstr &MI) {
     requireCount(2);
     requireReg(0, isInteger32, /*IsDef=*/true);
     requireReg(1, isInteger32, /*IsDef=*/false);
+    break;
+  case Brace::HOME_SAVE8:
+    if (!AllowsHomes)
+      reject("semantic-home operation is outside the S3b.3 leaf ABI");
+    requireCount(2);
+    requireHome(0);
+    requireReg(1, isInteger8, /*IsDef=*/false);
+    break;
+  case Brace::HOME_SAVE32:
+    if (!AllowsHomes)
+      reject("semantic-home operation is outside the S3b.3 leaf ABI");
+    requireCount(2);
+    requireHome(0);
+    requireReg(1, isInteger32, /*IsDef=*/false);
+    break;
+  case Brace::HOME_RESTORE8:
+    if (!AllowsHomes)
+      reject("semantic-home operation is outside the S3b.3 leaf ABI");
+    requireCount(2);
+    requireReg(0, isInteger8, /*IsDef=*/true);
+    requireHome(1);
+    break;
+  case Brace::HOME_RESTORE32:
+    if (!AllowsHomes)
+      reject("semantic-home operation is outside the S3b.3 leaf ABI");
+    requireCount(2);
+    requireReg(0, isInteger32, /*IsDef=*/true);
+    requireHome(1);
     break;
   case Brace::LOAD8:
     requireCount(2);
@@ -459,6 +496,122 @@ void verifyRegisterDefinitions(MachineFunction &MF) {
   }
 }
 
+bool isHomeSave(const MachineInstr &MI) {
+  return MI.getOpcode() == Brace::HOME_SAVE8 ||
+         MI.getOpcode() == Brace::HOME_SAVE32;
+}
+
+bool isHomeRestore(const MachineInstr &MI) {
+  return MI.getOpcode() == Brace::HOME_RESTORE8 ||
+         MI.getOpcode() == Brace::HOME_RESTORE32;
+}
+
+std::optional<unsigned> homeIndex(const MachineInstr &MI) {
+  unsigned Operand = 0;
+  if (isHomeSave(MI))
+    Operand = 0;
+  else if (isHomeRestore(MI))
+    Operand = 1;
+  else
+    return std::nullopt;
+  const int64_t Home = MI.getOperand(Operand).getImm();
+  if (Home < 0 || Home > 19)
+    reject("semantic-home ordinal is outside 0..19");
+  return static_cast<unsigned>(Home);
+}
+
+uint32_t blockHomeDefinitionMask(const MachineBasicBlock &MBB) {
+  uint32_t Mask = 0;
+  for (const MachineInstr &MI : MBB)
+    if (isHomeSave(MI))
+      Mask |= UINT32_C(1) << *homeIndex(MI);
+  return Mask;
+}
+
+void verifyHomeDefinitions(MachineFunction &MF) {
+  std::array<std::optional<uint8_t>, 20> Types{};
+  std::array<bool, 20> HasSave{};
+  std::array<bool, 20> HasRestore{};
+  std::optional<unsigned> Maximum;
+  for (const MachineBasicBlock &MBB : MF) {
+    for (const MachineInstr &MI : MBB) {
+      const std::optional<unsigned> Index = homeIndex(MI);
+      if (!Index)
+        continue;
+      const uint8_t Type = MI.getOpcode() == Brace::HOME_SAVE8 ||
+                                   MI.getOpcode() == Brace::HOME_RESTORE8
+                               ? Brace::I8
+                               : Brace::I32;
+      if (Types[*Index] && Types[*Index] != Type)
+        reject("semantic home is reused across value types");
+      Types[*Index] = Type;
+      if (isHomeSave(MI))
+        HasSave[*Index] = true;
+      else
+        HasRestore[*Index] = true;
+      Maximum = Maximum ? std::max(*Maximum, *Index) : *Index;
+    }
+  }
+  if (!Maximum)
+    return;
+  for (unsigned Index = 0; Index <= *Maximum; ++Index)
+    if (!Types[Index])
+      reject("semantic-home declaration contains a hole");
+
+  constexpr uint32_t AllHomes = (UINT32_C(1) << 20) - 1;
+  DenseMap<const MachineBasicBlock *, uint32_t> In;
+  DenseMap<const MachineBasicBlock *, uint32_t> Out;
+  for (const MachineBasicBlock &MBB : MF) {
+    const uint32_t Initial = &MBB == &MF.front() ? 0 : AllHomes;
+    In[&MBB] = Initial;
+    Out[&MBB] = Initial | blockHomeDefinitionMask(MBB);
+  }
+
+  bool Changed = true;
+  unsigned Iterations = 0;
+  while (Changed) {
+    if (++Iterations > 32)
+      reject("semantic-home definition analysis did not converge");
+    Changed = false;
+    for (const MachineBasicBlock &MBB : MF) {
+      uint32_t NewIn = 0;
+      if (&MBB != &MF.front()) {
+        NewIn = AllHomes;
+        bool HasPredecessor = false;
+        for (const MachineBasicBlock *Predecessor : MBB.predecessors()) {
+          NewIn &= Out[Predecessor];
+          HasPredecessor = true;
+        }
+        if (!HasPredecessor)
+          reject("non-entry block has no semantic-home predecessor");
+      }
+      const uint32_t NewOut = NewIn | blockHomeDefinitionMask(MBB);
+      if (In[&MBB] != NewIn || Out[&MBB] != NewOut) {
+        In[&MBB] = NewIn;
+        Out[&MBB] = NewOut;
+        Changed = true;
+      }
+    }
+  }
+
+  for (const MachineBasicBlock &MBB : MF) {
+    uint32_t State = In[&MBB];
+    for (const MachineInstr &MI : MBB) {
+      const std::optional<unsigned> Index = homeIndex(MI);
+      if (!Index)
+        continue;
+      const uint32_t Bit = UINT32_C(1) << *Index;
+      if (isHomeRestore(MI) && (State & Bit) == 0)
+        reject("semantic home is restored before a save on every path");
+      if (isHomeSave(MI))
+        State |= Bit;
+    }
+  }
+  for (unsigned Index = 0; Index <= *Maximum; ++Index)
+    if (!HasSave[Index] || !HasRestore[Index])
+      reject("every published semantic home requires both save and restore");
+}
+
 void transferPAddrDefinitions(const MachineBasicBlock &MBB, PAddrState &State) {
   if (!State.Reachable)
     return;
@@ -545,15 +698,21 @@ void verifyPAddrReachingDefinitions(MachineFunction &MF) {
 }
 
 class BraceFinalizeBranchesLegacy final : public MachineFunctionPass {
+  bool AllowsHomes = false;
+  std::string RequiredABI = BraceSdagLeafABIName.str();
+
 public:
   static char ID;
   BraceFinalizeBranchesLegacy() : MachineFunctionPass(ID) {}
+  explicit BraceFinalizeBranchesLegacy(const BraceTargetMachine &TM)
+      : MachineFunctionPass(ID), AllowsHomes(TM.usesSdagLeafHomeABI()),
+        RequiredABI(TM.getSdagABIName()) {}
 
   bool runOnMachineFunction(MachineFunction &MF) override {
     // MIR restart seams skip the ordinary IR pass pipeline.  Recheck the
     // complete embedded module here so a resumed compilation cannot pair an
     // exact command-line ABI with a stale or forged triple/layout/ABI body.
-    verifyBraceS3LateModuleEnvelope(*MF.getFunction().getParent());
+    verifyBraceS3LateModuleEnvelope(*MF.getFunction().getParent(), RequiredABI);
     if (MF.getName() != "brace_system_entry")
       reject("unexpected MachineFunction identity");
     const MachineFunctionProperties &Properties = MF.getProperties();
@@ -576,10 +735,9 @@ public:
         Properties.hasFailsVerification() || Properties.hasFailedRegAlloc())
       reject("MachineFunction state is outside the finite leaf envelope");
     MachineFrameInfo &Frame = MF.getFrameInfo();
-    if (Frame.getStackSize() != 0 || Frame.getNumObjects() != 0 ||
-        Frame.getNumFixedObjects() != 0 || Frame.hasVarSizedObjects() ||
-        Frame.hasStackProtectorIndex() || Frame.hasFunctionContextIndex() ||
-        Frame.getOffsetAdjustment() != 0 || Frame.getMaxAlign() != Align(1) ||
+    if (Frame.getStackSize() != 0 || Frame.getNumFixedObjects() != 0 ||
+        Frame.hasVarSizedObjects() || Frame.hasStackProtectorIndex() ||
+        Frame.hasFunctionContextIndex() || Frame.getOffsetAdjustment() != 0 ||
         Frame.getMaxCallFrameSize() != 0 ||
         Frame.getCVBytesOfCalleeSavedRegisters() != 0 ||
         !Frame.getCalleeSavedInfo().empty() ||
@@ -595,6 +753,19 @@ public:
         Frame.hasCopyImplyingStackAdjustment() ||
         Frame.hasMustTailInVarArgFunc() || Frame.hasTailCall())
       reject("stack, frame, return-address, and call state are forbidden");
+    if (!AllowsHomes &&
+        (Frame.getNumObjects() != 0 || Frame.getMaxAlign() != Align(1)))
+      reject("S3b.3 leaf publication requires an exact empty frame");
+    if (AllowsHomes) {
+      if (Frame.getMaxAlign() > Align(4))
+        reject("spill-home frame metadata exceeds i32 alignment");
+      for (int FI = Frame.getObjectIndexBegin();
+           FI != Frame.getObjectIndexEnd(); ++FI)
+        if (!Frame.isDeadObjectIndex(FI) || !Frame.isSpillSlotObjectIndex(FI) ||
+            Frame.getObjectAllocation(FI) ||
+            Frame.getStackID(FI) != TargetStackID::Default)
+          reject("non-dead or non-spill frame object survived S3b.4");
+    }
     const MachineRegisterInfo &MRI = MF.getRegInfo();
     const MCPhysReg *CalleeSaved = MRI.getCalleeSavedRegs();
     if (!MRI.tracksLiveness() || !MRI.livein_empty() ||
@@ -670,7 +841,7 @@ public:
       for (const MachineInstr &MI : MBB) {
         if (MI.isDebugInstr())
           reject("debug MachineInstr are not publishable");
-        verifyInstruction(MI);
+        verifyInstruction(MI, AllowsHomes);
         if (MI.isTerminator() && &MI != Last)
           reject("a terminator may only be the final operation in its block");
         if (MI.mayLoad() || MI.mayStore()) {
@@ -721,6 +892,8 @@ public:
       }
     }
     verifyRegisterDefinitions(MF);
+    if (AllowsHomes)
+      verifyHomeDefinitions(MF);
     verifyPAddrReachingDefinitions(MF);
     return Changed;
   }
@@ -738,6 +911,7 @@ INITIALIZE_PASS(BraceFinalizeBranchesLegacy, DEBUG_TYPE,
                 "Brace finalize branches and publication verifier", false,
                 false)
 
-FunctionPass *llvm::createBraceFinalizeBranchesPass() {
-  return new BraceFinalizeBranchesLegacy();
+FunctionPass *
+llvm::createBraceFinalizeBranchesPass(const BraceTargetMachine &TM) {
+  return new BraceFinalizeBranchesLegacy(TM);
 }

@@ -2017,7 +2017,8 @@ void Clang::AddBraceTargetArgs(const ArgList &Args,
     return;
 
   StringRef ABIName = A->getValue();
-  if (ABIName != "brace-system-s2-leaf-r0") {
+  if (ABIName != "brace-system-s2-leaf-r0" &&
+      ABIName != "brace-system-s2-leaf-home-r0") {
     getToolChain().getDriver().Diag(diag::err_drv_unsupported_option_argument)
         << A->getSpelling() << ABIName;
     return;

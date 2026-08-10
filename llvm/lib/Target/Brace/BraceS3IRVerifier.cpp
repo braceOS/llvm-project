@@ -17,6 +17,7 @@
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/ModRef.h"
 #include <optional>
+#include <string>
 
 using namespace llvm;
 
@@ -27,7 +28,6 @@ namespace {
 constexpr StringLiteral RequiredTriple = "brace64-unknown-none-elf";
 constexpr StringLiteral RequiredDataLayout =
     "e-m:e-p:64:64-i64:64-i128:128-n32:64-S128";
-constexpr StringLiteral RequiredABI = "brace-system-s2-leaf-r0";
 
 [[noreturn]] void reject(const Twine &Message) {
   report_fatal_error("brace64 S3b.3 leaf ABI: " + Message);
@@ -46,7 +46,7 @@ bool metadataStringEquals(const Metadata *MD, StringRef Expected) {
   return String && String->getString() == Expected;
 }
 
-bool canonicalModuleFlags(const NamedMDNode &Named) {
+bool canonicalModuleFlags(const NamedMDNode &Named, StringRef RequiredABI) {
   if (Named.getNumOperands() != 2)
     return false;
   auto IsFlag = [](const MDNode *Node, StringRef Key, auto ValuePredicate) {
@@ -58,7 +58,7 @@ bool canonicalModuleFlags(const NamedMDNode &Named) {
   };
   return IsFlag(Named.getOperand(0), "wchar_size",
                 [](const Metadata *MD) { return metadataI32Equals(MD, 4); }) &&
-         IsFlag(Named.getOperand(1), "target-abi", [](const Metadata *MD) {
+         IsFlag(Named.getOperand(1), "target-abi", [&](const Metadata *MD) {
            return metadataStringEquals(MD, RequiredABI);
          });
 }
@@ -302,7 +302,7 @@ void checkFunction(const Function &F) {
   }
 }
 
-void checkModuleEnvelope(const Module &M) {
+void checkModuleEnvelope(const Module &M, StringRef RequiredABI) {
   if (M.getTargetTriple().str() != RequiredTriple ||
       M.getDataLayoutStr() != RequiredDataLayout)
     reject("target triple or data layout mismatch");
@@ -318,7 +318,8 @@ void checkModuleEnvelope(const Module &M) {
   unsigned NamedCount = 0;
   for (const NamedMDNode &Named : M.named_metadata()) {
     ++NamedCount;
-    if (Named.getName() != "llvm.module.flags" || !canonicalModuleFlags(Named))
+    if (Named.getName() != "llvm.module.flags" ||
+        !canonicalModuleFlags(Named, RequiredABI))
       reject("noncanonical named metadata or module flags");
   }
   if (NamedCount != 1)
@@ -326,12 +327,15 @@ void checkModuleEnvelope(const Module &M) {
 }
 
 class BraceS3IRVerifier final : public ModulePass {
+  std::string RequiredABI;
+
 public:
   static char ID;
-  BraceS3IRVerifier() : ModulePass(ID) {}
+  explicit BraceS3IRVerifier(StringRef RequiredABI)
+      : ModulePass(ID), RequiredABI(RequiredABI) {}
 
   bool runOnModule(Module &M) override {
-    verifyBraceS3IRModule(M);
+    verifyBraceS3IRModule(M, RequiredABI);
     return false;
   }
 
@@ -342,18 +346,19 @@ public:
 
 } // namespace
 
-void llvm::verifyBraceS3IRModule(const Module &M) {
-  checkModuleEnvelope(M);
+void llvm::verifyBraceS3IRModule(const Module &M, StringRef RequiredABI) {
+  checkModuleEnvelope(M, RequiredABI);
   checkFunction(*M.begin());
 }
 
-void llvm::verifyBraceS3LateModuleEnvelope(const Module &M) {
-  checkModuleEnvelope(M);
+void llvm::verifyBraceS3LateModuleEnvelope(const Module &M,
+                                           StringRef RequiredABI) {
+  checkModuleEnvelope(M, RequiredABI);
   checkFunctionHeader(*M.begin());
 }
 
 char BraceS3IRVerifier::ID = 0;
 
-ModulePass *llvm::createBraceS3IRVerifierPass(const BraceTargetMachine &) {
-  return new BraceS3IRVerifier();
+ModulePass *llvm::createBraceS3IRVerifierPass(const BraceTargetMachine &TM) {
+  return new BraceS3IRVerifier(TM.getSdagABIName());
 }

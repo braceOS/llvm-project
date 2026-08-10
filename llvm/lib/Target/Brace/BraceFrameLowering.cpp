@@ -1,17 +1,45 @@
 //===-- BraceFrameLowering.cpp - Brace frame lowering --------------------===//
 
 #include "BraceFrameLowering.h"
+#include "Brace.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
 #include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Target/TargetMachine.h"
 
 using namespace llvm;
 
+namespace {
+
+bool usesSpillHomes(const MachineFunction &MF) {
+  return MF.getTarget().Options.MCOptions.getABIName() ==
+         BraceSdagLeafHomeABIName;
+}
+
+bool hasOnlyDeadSpillObjects(const MachineFrameInfo &Frame) {
+  if (Frame.getNumFixedObjects() != 0)
+    return false;
+  for (int FI = Frame.getObjectIndexBegin(); FI != Frame.getObjectIndexEnd();
+       ++FI)
+    if (!Frame.isDeadObjectIndex(FI) || !Frame.isSpillSlotObjectIndex(FI) ||
+        Frame.getObjectAllocation(FI))
+      return false;
+  return true;
+}
+
+} // namespace
+
 void BraceFrameLowering::emitPrologue(MachineFunction &MF,
                                       MachineBasicBlock &) const {
-  if (MF.getFrameInfo().getStackSize() != 0 ||
-      MF.getFrameInfo().getNumObjects() != 0)
+  const MachineFrameInfo &Frame = MF.getFrameInfo();
+  if (usesSpillHomes(MF)) {
+    if (Frame.getStackSize() != 0 || !hasOnlyDeadSpillObjects(Frame))
+      report_fatal_error(
+          "brace64 S3b.4 spill-home ABI requires zero Guest frame storage");
+    return;
+  }
+  if (Frame.getStackSize() != 0 || Frame.getNumObjects() != 0)
     report_fatal_error("brace64 S3b.3 leaf ABI requires an empty frame");
 }
 

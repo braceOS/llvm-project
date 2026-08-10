@@ -18,10 +18,14 @@ namespace llvm {
 class TargetLoweringObjectFile;
 
 class BraceTargetMachine final : public CodeGenTargetMachineImpl {
+public:
+  enum class SdagABIKind { None, Leaf, LeafHome };
+
+private:
   BraceSubtarget Subtarget;
   std::unique_ptr<TargetLoweringObjectFile> TLOF;
   bool UnsupportedConfiguration = false;
-  bool SdagLeafABI = false;
+  SdagABIKind SdagABI = SdagABIKind::None;
 
 public:
   BraceTargetMachine(const Target &T, const Triple &TT, StringRef CPU,
@@ -50,7 +54,10 @@ public:
   createMCStreamer(raw_pwrite_stream &Out, raw_pwrite_stream *DwoOut,
                    CodeGenFileType FileType, MCContext &Ctx) override;
 
-  bool usesSdagLeafABI() const { return SdagLeafABI; }
+  bool usesSdagABI() const { return SdagABI != SdagABIKind::None; }
+  bool usesSdagLeafABI() const { return SdagABI == SdagABIKind::Leaf; }
+  bool usesSdagLeafHomeABI() const { return SdagABI == SdagABIKind::LeafHome; }
+  StringRef getSdagABIName() const;
   bool isMachineVerifierClean() const override { return true; }
 };
 

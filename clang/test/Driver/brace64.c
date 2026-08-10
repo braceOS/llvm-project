@@ -4,6 +4,9 @@
 // RUN: %clang -### --target=brace64-unknown-none-elf -ffreestanding \
 // RUN:   -nostdinc -c -emit-llvm -mabi=brace-system-s2-leaf-r0 %s 2>&1 | \
 // RUN:   FileCheck -check-prefix=LEAF-ABI %s
+// RUN: %clang -### --target=brace64-unknown-none-elf -ffreestanding \
+// RUN:   -nostdinc -c -emit-llvm -mabi=brace-system-s2-leaf-home-r0 %s \
+// RUN:   2>&1 | FileCheck -check-prefix=HOME-ABI %s
 // RUN: not %clang -### --target=brace64-unknown-none-elf -ffreestanding \
 // RUN:   -nostdinc -c -emit-llvm -mabi=not-brace %s 2>&1 | \
 // RUN:   FileCheck -check-prefix=BAD-ABI %s
@@ -20,6 +23,10 @@
 // LEAF-ABI: "-cc1"
 // LEAF-ABI-SAME: "-triple" "brace64-unknown-none-elf"
 // LEAF-ABI-SAME: "-target-abi" "brace-system-s2-leaf-r0"
+
+// HOME-ABI: "-cc1"
+// HOME-ABI-SAME: "-triple" "brace64-unknown-none-elf"
+// HOME-ABI-SAME: "-target-abi" "brace-system-s2-leaf-home-r0"
 
 // BAD-ABI: error: unsupported argument 'not-brace' to option '-mabi='
 
