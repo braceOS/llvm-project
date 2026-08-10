@@ -137,6 +137,32 @@
 ; RUN:   %t/nonspill.mir -o %t/nonspill.o 2>&1 | \
 ; RUN:   FileCheck %s --check-prefix=NONSPILL
 ; RUN: test ! -s %t/nonspill.o
+; RUN: sed 's/isCalleeSavedInfoValid: false/isCalleeSavedInfoValid: true/' \
+; RUN:   %t/i32.pre.mir > %t/callee-saved-pre.mir
+; RUN: not --crash %{brace-s3b4-llc} -start-after=virtregrewriter \
+; RUN:   %t/callee-saved-pre.mir -o %t/callee-saved-pre.o 2>&1 | \
+; RUN:   FileCheck %s --check-prefix=CALLEE-SAVED-PRE
+; RUN: test ! -s %t/callee-saved-pre.o
+; RUN: sed 's/isCalleeSavedInfoValid: false/isCalleeSavedInfoValid: true/' \
+; RUN:   %t/i32.post.mir > %t/callee-saved-post.mir
+; RUN: not --crash %{brace-s3b4-llc} \
+; RUN:   -start-after=brace-finalize-spill-homes %t/callee-saved-post.mir \
+; RUN:   -o %t/callee-saved-post.o 2>&1 | \
+; RUN:   FileCheck %s --check-prefix=CALLEE-SAVED-POST
+; RUN: test ! -s %t/callee-saved-post.o
+; RUN: sed 's/maxCallFrameSize: 4294967295/maxCallFrameSize: 1/' \
+; RUN:   %t/i32.pre.mir > %t/call-frame-pre.mir
+; RUN: not --crash %{brace-s3b4-llc} -start-after=virtregrewriter \
+; RUN:   %t/call-frame-pre.mir -o %t/call-frame-pre.o 2>&1 | \
+; RUN:   FileCheck %s --check-prefix=CALL-FRAME-PRE
+; RUN: test ! -s %t/call-frame-pre.o
+; RUN: sed 's/maxCallFrameSize: 4294967295/maxCallFrameSize: 1/' \
+; RUN:   %t/i32.post.mir > %t/call-frame-post.mir
+; RUN: not --crash %{brace-s3b4-llc} \
+; RUN:   -start-after=brace-finalize-spill-homes %t/call-frame-post.mir \
+; RUN:   -o %t/call-frame-post.o 2>&1 | \
+; RUN:   FileCheck %s --check-prefix=CALL-FRAME-POST
+; RUN: test ! -s %t/call-frame-post.o
 ; RUN: sed 's/brace-system-s2-leaf-home-r0/brace-system-s2-leaf-r0/' \
 ; RUN:   %t/i32.post.mir > %t/abi-mismatch.mir
 ; RUN: not --crash %{brace-s3b4-llc} \
@@ -235,6 +261,10 @@
 ; TYPE: LLVM ERROR: brace64 S3b.3 post-RA verifier: semantic home is reused across value types
 ; RANGE: LLVM ERROR: brace64 S3b.3 post-RA verifier: semantic-home ordinal is outside 0..19
 ; NONSPILL: LLVM ERROR: brace64 S3b.4 spill-home finalizer: spill pseudo refers to a noncanonical spill frame index
+; CALLEE-SAVED-PRE: LLVM ERROR: brace64 S3b.4 spill-home finalizer: non-spill stack, frame, or call state is forbidden
+; CALLEE-SAVED-POST: LLVM ERROR: brace64 S3b.4 post-home frame verifier: noncanonical pre-PEI frame state is forbidden
+; CALL-FRAME-PRE: LLVM ERROR: brace64 S3b.4 spill-home finalizer: non-spill stack, frame, or call state is forbidden
+; CALL-FRAME-POST: LLVM ERROR: brace64 S3b.4 post-home frame verifier: noncanonical pre-PEI frame state is forbidden
 ; MAX-HOMES: stack:           []
 ; MAX-HOMES: HOME_SAVE32 19, killed $r4
 ; MAX-HOMES: $r4 = HOME_RESTORE32 19

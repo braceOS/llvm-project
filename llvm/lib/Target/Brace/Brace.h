@@ -27,10 +27,12 @@ void verifyBraceS3IRModule(const Module &M, StringRef RequiredABI);
 void verifyBraceS3LateModuleEnvelope(const Module &M, StringRef RequiredABI);
 FunctionPass *createBraceISelDag(BraceTargetMachine &TM);
 FunctionPass *createBraceFinalizeSpillHomesPass();
+FunctionPass *createBraceVerifyPostHomeFramePass();
 FunctionPass *createBraceFinalizeBranchesPass(const BraceTargetMachine &TM);
 
 void initializeBraceDAGToDAGISelLegacyPass(PassRegistry &);
 void initializeBraceFinalizeSpillHomesLegacyPass(PassRegistry &);
+void initializeBraceVerifyPostHomeFrameLegacyPass(PassRegistry &);
 void initializeBraceFinalizeBranchesLegacyPass(PassRegistry &);
 
 inline constexpr StringLiteral BraceSdagLeafABIName = "brace-system-s2-leaf-r0";

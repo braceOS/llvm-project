@@ -64,8 +64,10 @@ public:
   void addBlockPlacement() override {}
 
   void addPostRegAlloc() override {
-    if (getBraceTargetMachine().usesSdagLeafHomeABI())
+    if (getBraceTargetMachine().usesSdagLeafHomeABI()) {
       addPass(createBraceFinalizeSpillHomesPass());
+      addPass(createBraceVerifyPostHomeFramePass());
+    }
   }
 
   void addPreEmitPass2() override {
@@ -175,5 +177,6 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeBraceTarget() {
   PassRegistry &PR = *PassRegistry::getPassRegistry();
   initializeBraceDAGToDAGISelLegacyPass(PR);
   initializeBraceFinalizeSpillHomesLegacyPass(PR);
+  initializeBraceVerifyPostHomeFrameLegacyPass(PR);
   initializeBraceFinalizeBranchesLegacyPass(PR);
 }

@@ -32,6 +32,32 @@ namespace {
   report_fatal_error("brace64 S3b.4 spill-home finalizer: " + Message);
 }
 
+[[noreturn]] void rejectPostHome(const Twine &Message) {
+  report_fatal_error("brace64 S3b.4 post-home frame verifier: " + Message);
+}
+
+bool hasCanonicalPrePEIFrameState(const MachineFrameInfo &Frame) {
+  return Frame.getStackSize() == 0 && Frame.getNumFixedObjects() == 0 &&
+         !Frame.hasVarSizedObjects() && !Frame.hasStackProtectorIndex() &&
+         !Frame.hasFunctionContextIndex() && Frame.getOffsetAdjustment() == 0 &&
+         !Frame.isMaxCallFrameSizeComputed() &&
+         Frame.getCVBytesOfCalleeSavedRegisters() == 0 &&
+         Frame.getCalleeSavedInfo().empty() &&
+         !Frame.isCalleeSavedInfoValid() &&
+         Frame.getLocalFrameObjectCount() == 0 &&
+         Frame.getLocalFrameSize() == 0 &&
+         Frame.getLocalFrameMaxAlign() == Align(1) &&
+         !Frame.getUseLocalStackAllocationBlock() &&
+         Frame.getSavePoints().empty() && Frame.getRestorePoints().empty() &&
+         Frame.getUnsafeStackSize() == 0 && !Frame.hasCalls() &&
+         !Frame.isFrameAddressTaken() && !Frame.isReturnAddressTaken() &&
+         !Frame.hasStackMap() && !Frame.hasPatchPoint() &&
+         !Frame.adjustsStack() && !Frame.hasOpaqueSPAdjustment() &&
+         !Frame.hasVAStart() && !Frame.hasCopyImplyingStackAdjustment() &&
+         !Frame.hasMustTailInVarArgFunc() && !Frame.hasTailCall() &&
+         Frame.getMaxAlign() <= Align(4);
+}
+
 enum class HomeKind : uint8_t { I8, I32 };
 
 struct SpillInfo {
@@ -133,15 +159,7 @@ public:
       reject("pass ran outside its exact codegen profile");
 
     MachineFrameInfo &Frame = MF.getFrameInfo();
-    if (Frame.getNumFixedObjects() != 0 || Frame.hasVarSizedObjects() ||
-        Frame.hasStackProtectorIndex() || Frame.hasFunctionContextIndex() ||
-        Frame.getLocalFrameObjectCount() != 0 ||
-        Frame.getLocalFrameSize() != 0 ||
-        Frame.getUseLocalStackAllocationBlock() || Frame.hasCalls() ||
-        Frame.isFrameAddressTaken() || Frame.isReturnAddressTaken() ||
-        Frame.hasStackMap() || Frame.hasPatchPoint() || Frame.adjustsStack() ||
-        Frame.hasOpaqueSPAdjustment() || Frame.hasVAStart() ||
-        Frame.hasCopyImplyingStackAdjustment() || Frame.hasTailCall())
+    if (!hasCanonicalPrePEIFrameState(Frame))
       reject("non-spill stack, frame, or call state is forbidden");
 
     DenseMap<int, SpillInfo> Spills;
@@ -236,13 +254,50 @@ public:
   }
 };
 
+class BraceVerifyPostHomeFrameLegacy final : public MachineFunctionPass {
+public:
+  static char ID;
+  BraceVerifyPostHomeFrameLegacy() : MachineFunctionPass(ID) {}
+
+  bool runOnMachineFunction(MachineFunction &MF) override {
+    if (MF.getTarget().Options.MCOptions.getABIName() !=
+        BraceSdagLeafHomeABIName)
+      rejectPostHome("pass ran outside its exact codegen profile");
+
+    const MachineFrameInfo &Frame = MF.getFrameInfo();
+    if (!hasCanonicalPrePEIFrameState(Frame))
+      rejectPostHome("noncanonical pre-PEI frame state is forbidden");
+    for (int FI = Frame.getObjectIndexBegin(); FI != Frame.getObjectIndexEnd();
+         ++FI)
+      if (FI < 0 || !Frame.isDeadObjectIndex(FI) ||
+          !Frame.isSpillSlotObjectIndex(FI) ||
+          Frame.getObjectAllocation(FI) ||
+          Frame.getStackID(FI) != TargetStackID::Default)
+        rejectPostHome("live or non-spill frame object survived finalization");
+    return false;
+  }
+
+  StringRef getPassName() const override {
+    return "Brace S3b.4 post-home frame verifier";
+  }
+};
+
 } // namespace
 
 char BraceFinalizeSpillHomesLegacy::ID = 0;
+char BraceVerifyPostHomeFrameLegacy::ID = 0;
 
 INITIALIZE_PASS(BraceFinalizeSpillHomesLegacy, DEBUG_TYPE,
                 "Brace S3b.4 typed spill-home finalizer", false, false)
 
+INITIALIZE_PASS(BraceVerifyPostHomeFrameLegacy,
+                "brace-verify-post-home-frame",
+                "Brace S3b.4 post-home frame verifier", false, false)
+
 FunctionPass *llvm::createBraceFinalizeSpillHomesPass() {
   return new BraceFinalizeSpillHomesLegacy();
+}
+
+FunctionPass *llvm::createBraceVerifyPostHomeFramePass() {
+  return new BraceVerifyPostHomeFrameLegacy();
 }
