@@ -12,10 +12,11 @@ using namespace llvm;
 
 namespace {
 
-bool usesSpillHomes(const MachineFunction &MF) {
+bool usesFinalizedSpillStorage(const MachineFunction &MF) {
   const StringRef ABI = MF.getTarget().Options.MCOptions.getABIName();
   return ABI == BraceSdagLeafHomeABIName ||
-         ABI == BraceSdagDirectCallHomeABIName;
+         ABI == BraceSdagDirectCallHomeABIName ||
+         ABI == BraceSdagDirectCallByteFrameABIName;
 }
 
 bool hasOnlyDeadSpillObjects(const MachineFrameInfo &Frame) {
@@ -34,10 +35,10 @@ bool hasOnlyDeadSpillObjects(const MachineFrameInfo &Frame) {
 void BraceFrameLowering::emitPrologue(MachineFunction &MF,
                                       MachineBasicBlock &) const {
   const MachineFrameInfo &Frame = MF.getFrameInfo();
-  if (usesSpillHomes(MF)) {
+  if (usesFinalizedSpillStorage(MF)) {
     if (Frame.getStackSize() != 0 || !hasOnlyDeadSpillObjects(Frame))
       report_fatal_error(
-          "brace64 S3b.4 spill-home ABI requires zero Guest frame storage");
+          "brace64 finalized spill transport requires zero LLVM frame storage");
     return;
   }
   if (Frame.getStackSize() != 0 || Frame.getNumObjects() != 0)

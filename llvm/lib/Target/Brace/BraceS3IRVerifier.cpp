@@ -42,9 +42,14 @@ constexpr StringLiteral RequiredDataLayout =
   report_fatal_error("brace64 S3b.6 direct-call-home ABI: " + Message);
 }
 
+[[noreturn]] void rejectDirectByteFrame(const Twine &Message) {
+  report_fatal_error("brace64 S3b.7c direct-call-byte-frame ABI: " + Message);
+}
+
 bool isDirectCallABIName(StringRef ABI) {
   return ABI == BraceSdagDirectCallABIName ||
-         ABI == BraceSdagDirectCallHomeABIName;
+         ABI == BraceSdagDirectCallHomeABIName ||
+         ABI == BraceSdagDirectCallByteFrameABIName;
 }
 
 bool metadataI32Equals(const Metadata *MD, uint32_t Expected) {
@@ -565,15 +570,20 @@ struct DirectCounts final {
   unsigned Edges = 0;
   unsigned Values = 0;
   unsigned Memory = 0;
+  unsigned CallLiveValues = 0;
   const CallInst *Call = nullptr;
 };
 
 DirectCounts checkDirectFunction(const Function &F, const Function &Helper,
                                  bool IsHelper, bool HasPhysicalEffects,
-                                 bool AllowsCallLiveHome = false) {
+                                 bool AllowsCallLiveHome = false,
+                                 bool AllowsCallLiveByteFrame = false) {
   checkDirectFunctionHeader(F, IsHelper, HasPhysicalEffects);
   if (F.empty() || F.size() > 4)
     rejectDirect("basic-block count is outside 1..4");
+  if (AllowsCallLiveByteFrame && !F.getEntryBlock().hasNPredecessors(0))
+    rejectDirectByteFrame(
+        "function entry block must not have a predecessor or backedge");
 
   SmallPtrSet<const BasicBlock *, 4> Reachable;
   SmallVector<const BasicBlock *, 4> Worklist{&F.getEntryBlock()};
@@ -690,6 +700,9 @@ DirectCounts checkDirectFunction(const Function &F, const Function &Helper,
       rejectDirect("instruction is outside the S3b.5 direct-call profile");
     }
   }
+  if (AllowsCallLiveByteFrame && ReturnCount != 1)
+    rejectDirectByteFrame(
+        "each function requires exactly one signature-matching Return");
   if (ReturnCount == 0)
     rejectDirect("each direct-call function requires a Return");
   if ((!IsHelper && !Counts.Call) || (IsHelper && Counts.Call))
@@ -750,20 +763,29 @@ DirectCounts checkDirectFunction(const Function &F, const Function &Helper,
         const auto *Use = dyn_cast<Instruction>(U);
         if (!Use || !AfterCall.contains(Use))
           continue;
-        if (!AllowsCallLiveHome)
+        if (!AllowsCallLiveHome && !AllowsCallLiveByteFrame)
           rejectDirect("caller SSA value remains live across the call");
         const auto *Load = dyn_cast<LoadInst>(I);
         if (!Load || !Load->getType()->isIntegerTy(32))
-          rejectDirectHome(
-              "call-live home must originate from one i32 physical load");
+          AllowsCallLiveByteFrame
+              ? rejectDirectByteFrame(
+                    "call-live frame value must originate from one i32 "
+                    "physical load")
+              : rejectDirectHome(
+                    "call-live home must originate from one i32 physical load");
         CallLiveValues.insert(I);
         ++CallLiveUses;
       }
-    if (AllowsCallLiveHome &&
+    if ((AllowsCallLiveHome || AllowsCallLiveByteFrame) &&
         (CallLiveValues.size() > 1 || CallLiveUses != CallLiveValues.size()))
-      rejectDirectHome(
-          "root permits H0 or exactly one i32 SSA value with one post-call "
-          "use");
+      AllowsCallLiveByteFrame
+          ? rejectDirectByteFrame(
+                "root permits BF0 or exactly one i32 SSA value with one "
+                "post-call use")
+          : rejectDirectHome(
+                "root permits H0 or exactly one i32 SSA value with one "
+                "post-call use");
+    Counts.CallLiveValues = CallLiveValues.size();
     for (const User *U : Counts.Call->users()) {
       const auto *Use = dyn_cast<Instruction>(U);
       if (!Use || !AfterCall.contains(Use))
@@ -771,6 +793,36 @@ DirectCounts checkDirectFunction(const Function &F, const Function &Helper,
     }
   }
   return Counts;
+}
+
+bool checkDirectCallModule(const Module &M, StringRef RequiredABI) {
+  const Function *Entry = M.getFunction("brace_system_entry");
+  const Function *Helper = M.getFunction("brace_system_call_leaf");
+  if (!Entry || !Helper)
+    rejectDirect("required entry or helper identity is missing");
+  for (const User *U : Helper->users()) {
+    const auto *Call = dyn_cast<CallInst>(U);
+    if (!Call || Call->getCalledFunction() != Helper ||
+        Call->getFunction() != Entry)
+      rejectDirect("helper address escapes the single direct call");
+  }
+  const bool HelperPhysical = hasDirectPhysicalMemory(*Helper);
+  const bool DirectCallHome = RequiredABI == BraceSdagDirectCallHomeABIName;
+  const bool DirectCallByteFrame =
+      RequiredABI == BraceSdagDirectCallByteFrameABIName;
+  const DirectCounts EntryCounts =
+      checkDirectFunction(*Entry, *Helper, false,
+                          hasDirectPhysicalMemory(*Entry) || HelperPhysical,
+                          DirectCallHome, DirectCallByteFrame);
+  const DirectCounts HelperCounts =
+      checkDirectFunction(*Helper, *Helper, true, HelperPhysical,
+                          /*AllowsCallLiveHome=*/false, DirectCallByteFrame);
+  if (EntryCounts.Instructions + HelperCounts.Instructions > 199 ||
+      EntryCounts.Edges + HelperCounts.Edges > 12 ||
+      EntryCounts.Values + HelperCounts.Values > 128 ||
+      EntryCounts.Memory + HelperCounts.Memory > 64)
+    rejectDirect("module resource limit exceeded");
+  return EntryCounts.CallLiveValues == 1;
 }
 
 void checkModuleEnvelope(const Module &M, StringRef RequiredABI) {
@@ -816,14 +868,29 @@ void checkModuleEnvelope(const Module &M, StringRef RequiredABI) {
 
 class BraceS3IRVerifier final : public ModulePass {
   std::string RequiredABI;
+  bool VerifyDuringInitialization = false;
 
 public:
   static char ID;
   explicit BraceS3IRVerifier(StringRef RequiredABI)
-      : ModulePass(ID), RequiredABI(RequiredABI) {}
+      : ModulePass(ID), RequiredABI(RequiredABI),
+        VerifyDuringInitialization(
+            RequiredABI == BraceSdagDirectCallByteFrameABIName) {}
+
+  bool doInitialization(Module &M) override {
+    // A legacy FunctionPassManager initializes AsmPrinter before running the
+    // preceding ModulePass body.  Close the target IR boundary during module
+    // initialization so generic AsmPrinter initialization cannot consume
+    // module asm (or any other rejected module envelope) first.
+    if (VerifyDuringInitialization)
+      verifyBraceS3IRModule(M, RequiredABI);
+    return false;
+  }
 
   bool runOnModule(Module &M) override {
-    verifyBraceS3IRModule(M, RequiredABI);
+    // Preserve the accepted S3b.3/S3b.5/S3b.6 verifier and first-error timing.
+    if (!VerifyDuringInitialization)
+      verifyBraceS3IRModule(M, RequiredABI);
     return false;
   }
 
@@ -837,31 +904,15 @@ public:
 void llvm::verifyBraceS3IRModule(const Module &M, StringRef RequiredABI) {
   checkModuleEnvelope(M, RequiredABI);
   if (isDirectCallABIName(RequiredABI)) {
-    const Function *Entry = M.getFunction("brace_system_entry");
-    const Function *Helper = M.getFunction("brace_system_call_leaf");
-    if (!Entry || !Helper)
-      rejectDirect("required entry or helper identity is missing");
-    for (const User *U : Helper->users()) {
-      const auto *Call = dyn_cast<CallInst>(U);
-      if (!Call || Call->getCalledFunction() != Helper ||
-          Call->getFunction() != Entry)
-        rejectDirect("helper address escapes the single direct call");
-    }
-    const bool HelperPhysical = hasDirectPhysicalMemory(*Helper);
-    const bool DirectCallHome = RequiredABI == BraceSdagDirectCallHomeABIName;
-    const DirectCounts EntryCounts = checkDirectFunction(
-        *Entry, *Helper, false,
-        hasDirectPhysicalMemory(*Entry) || HelperPhysical, DirectCallHome);
-    const DirectCounts HelperCounts =
-        checkDirectFunction(*Helper, *Helper, true, HelperPhysical);
-    if (EntryCounts.Instructions + HelperCounts.Instructions > 199 ||
-        EntryCounts.Edges + HelperCounts.Edges > 12 ||
-        EntryCounts.Values + HelperCounts.Values > 128 ||
-        EntryCounts.Memory + HelperCounts.Memory > 64)
-      rejectDirect("module resource limit exceeded");
+    (void)checkDirectCallModule(M, RequiredABI);
     return;
   }
   checkFunction(*M.begin());
+}
+
+bool llvm::verifyBraceS3ByteFrameIRAndRequiresRootFrame(const Module &M) {
+  checkModuleEnvelope(M, BraceSdagDirectCallByteFrameABIName);
+  return checkDirectCallModule(M, BraceSdagDirectCallByteFrameABIName);
 }
 
 void llvm::verifyBraceS3LateModuleEnvelope(const Module &M,

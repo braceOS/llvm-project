@@ -2026,18 +2026,35 @@ void Clang::AddBraceTargetArgs(const ArgList &Args,
   if (!A)
     return;
 
+  unsigned ABIArgumentCount = 0;
+  const Arg *ByteFrameArgument = nullptr;
+  for (const Arg *ABIArgument : Args.filtered(options::OPT_mabi_EQ)) {
+    ++ABIArgumentCount;
+    if (StringRef(ABIArgument->getValue()) ==
+        "brace-system-s2-direct-call-byte-frame-r0")
+      ByteFrameArgument = ABIArgument;
+  }
+  if (ByteFrameArgument && ABIArgumentCount != 1) {
+    getToolChain().getDriver().Diag(diag::err_drv_unsupported_opt_for_target)
+        << ByteFrameArgument->getAsString(Args)
+        << getToolChain().getTriple().str();
+    return;
+  }
+
   StringRef ABIName = A->getValue();
   if (ABIName != "brace-system-s2-leaf-r0" &&
       ABIName != "brace-system-s2-leaf-home-r0" &&
       ABIName != "brace-system-s2-direct-call-r0" &&
-      ABIName != "brace-system-s2-direct-call-home-r0") {
+      ABIName != "brace-system-s2-direct-call-home-r0" &&
+      ABIName != "brace-system-s2-direct-call-byte-frame-r0") {
     getToolChain().getDriver().Diag(diag::err_drv_unsupported_option_argument)
         << A->getSpelling() << ABIName;
     return;
   }
 
   if (ABIName == "brace-system-s2-direct-call-r0" ||
-      ABIName == "brace-system-s2-direct-call-home-r0") {
+      ABIName == "brace-system-s2-direct-call-home-r0" ||
+      ABIName == "brace-system-s2-direct-call-byte-frame-r0") {
     const Arg *Unsupported =
         Args.getLastArg(options::OPT_flto, options::OPT_flto_EQ);
     if (!Unsupported)

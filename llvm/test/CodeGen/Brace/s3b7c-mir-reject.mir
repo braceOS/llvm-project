@@ -1,0 +1,481 @@
+# REQUIRES: brace-registered-target
+#
+# Every restart seam is untrusted.  Generate canonical MIR from the normalized
+# producer, mutate one target-owned invariant at a time, and require rejection
+# before any object bytes are published.
+#
+# DEFINE: %{brace-s3b7c-llc} = llc -mtriple=brace64-unknown-none-elf \
+# DEFINE:   -target-abi=brace-system-s2-direct-call-byte-frame-r0 -O1 \
+# DEFINE:   -verify-machineinstrs -filetype=obj
+# DEFINE: %{brace-s3b6-llc} = llc -mtriple=brace64-unknown-none-elf \
+# DEFINE:   -target-abi=brace-system-s2-direct-call-home-r0 -O1 \
+# DEFINE:   -verify-machineinstrs -filetype=obj
+# RUN: split-file %s %t.parts
+#
+# RUN: %{brace-s3b7c-llc} -stop-after=virtregrewriter \
+# RUN:   %S/s3b7c-direct-call-byte-frame.ll -o %t.ra.mir
+# RUN: %python %t.parts/renumber.py 1 %t.ra.mir %t.fi1.mir
+# RUN: FileCheck %s --check-prefix=FI1-INPUT --input-file=%t.fi1.mir
+# RUN: %{brace-s3b7c-llc} -start-after=virtregrewriter \
+# RUN:   -stop-after=brace-finalize-byte-frame %t.ra.mir -o %t.fi0.frame.mir
+# RUN: %{brace-s3b7c-llc} -start-after=virtregrewriter \
+# RUN:   -stop-after=brace-finalize-byte-frame %t.fi1.mir -o %t.fi1.frame.mir
+# RUN: FileCheck %s --check-prefix=FI-FINAL --input-file=%t.fi0.frame.mir
+# RUN: FileCheck %s --check-prefix=FI-FINAL --input-file=%t.fi1.frame.mir
+# RUN: %{brace-s3b7c-llc} -start-after=virtregrewriter \
+# RUN:   %t.ra.mir -o %t.fi0.o
+# RUN: %{brace-s3b7c-llc} -start-after=virtregrewriter \
+# RUN:   %t.fi1.mir -o %t.fi1.o
+# RUN: cmp %t.fi0.o %t.fi1.o
+#
+# Retained, fully revalidated IR is the independent BF0/BF1 intent authority
+# at pre- and post-finalizer restart seams.  Removing the allocator's sole
+# spill or all four semantic FRAME operations cannot silently downgrade the
+# canonical BF1 source to BF0, even when the remaining physical MIR is a
+# self-consistent no-frame program.
+# RUN: %python %t.parts/remove-frame.py pre %t.ra.mir %t.no-spill.mir
+# RUN: not --crash %{brace-s3b7c-llc} -start-after=virtregrewriter \
+# RUN:   %t.no-spill.mir -o %t.no-spill.o 2>&1 | \
+# RUN:   FileCheck %s --check-prefix=NO-SPILL
+# RUN: test ! -s %t.no-spill.o
+#
+# Even with the CLI's automatic verifier disabled, the two explicitly named
+# target-owned wrappers remain on both sides of byte-frame finalization and
+# final branch publication.
+# RUN: %{brace-s3b7c-llc} -verify-machineinstrs=false \
+# RUN:   -start-after=virtregrewriter -debug-pass=Structure %t.ra.mir \
+# RUN:   -o %t.no-auto-verifier.o 2> %t.pipeline.log
+# RUN: FileCheck %s --check-prefix=PIPELINE --input-file=%t.pipeline.log
+# RUN: grep -F 'Verify generated machine code' %t.pipeline.log | count 4
+# RUN: cmp %t.fi0.o %t.no-auto-verifier.o
+#
+# The only restart-only normalization is one exact leading inert i32 spill
+# record.  A second record or any field drift is rejected before mutation.
+# RUN: %python %t.parts/renumber.py 2 %t.ra.mir %t.fi2.mir
+# RUN: not --crash %{brace-s3b7c-llc} -start-after=virtregrewriter \
+# RUN:   %t.fi2.mir -o %t.fi2.o 2>&1 | \
+# RUN:   FileCheck %s --check-prefix=BOOKKEEPING-MULTIPLE
+# RUN: test ! -s %t.fi2.o
+# RUN: sed 's/{ id: 0, type: spill-slot, offset: 0, size: 4, alignment: 4 }/{ id: 0, type: spill-slot, offset: 0, size: 8, alignment: 4 }/' \
+# RUN:   %t.fi1.mir > %t.fi1-bad-size.mir
+# RUN: not --crash %{brace-s3b7c-llc} -start-after=virtregrewriter \
+# RUN:   %t.fi1-bad-size.mir -o %t.fi1-bad-size.o 2>&1 | \
+# RUN:   FileCheck %s --check-prefix=BOOKKEEPING-SHAPE
+# RUN: test ! -s %t.fi1-bad-size.o
+# RUN: %{brace-s3b7c-llc} -stop-after=brace-finalize-byte-frame \
+# RUN:   %S/s3b7c-direct-call-byte-frame.ll -o %t.frame.mir
+# RUN: %{brace-s3b7c-llc} -stop-after=brace-finalize-branches \
+# RUN:   %S/s3b7c-direct-call-byte-frame.ll -o %t.final.mir
+# RUN: %python %t.parts/remove-frame.py post %t.frame.mir %t.no-frame.mir
+# RUN: not --crash %{brace-s3b7c-llc} \
+# RUN:   -start-after=brace-finalize-byte-frame %t.no-frame.mir \
+# RUN:   -o %t.no-frame.o 2>&1 | FileCheck %s --check-prefix=NO-FRAME
+# RUN: test ! -s %t.no-frame.o
+# RUN: %python %t.parts/remove-frame.py post-mmo %t.frame.mir \
+# RUN:   %t.no-frame-mmo.mir
+# RUN: not --crash %{brace-s3b7c-llc} \
+# RUN:   -start-after=brace-finalize-byte-frame %t.no-frame-mmo.mir \
+# RUN:   -o %t.no-frame-mmo.o 2>&1 | \
+# RUN:   FileCheck %s --check-prefix=NO-FRAME-MMO-FIRST
+# RUN: test ! -s %t.no-frame-mmo.o
+# RUN: %python %t.parts/remove-frame.py post %t.final.mir \
+# RUN:   %t.final-no-frame.mir
+# RUN: not --crash %{brace-s3b7c-llc} \
+# RUN:   -start-after=brace-finalize-branches %t.final-no-frame.mir \
+# RUN:   -o %t.final-no-frame.o 2>&1 | \
+# RUN:   FileCheck %s --check-prefix=FINAL-NO-FRAME
+# RUN: test ! -s %t.final-no-frame.o
+#
+# The independent final-publication pass is deliberately not a sixth restart
+# seam.  Its private completion token is not serialized, and the byte-frame
+# selector admits only the five contractual start-after names above.
+# RUN: %{brace-s3b7c-llc} \
+# RUN:   -stop-after=brace-verify-final-byte-frame-publication \
+# RUN:   %S/s3b7c-direct-call-byte-frame.ll -o %t.publication.mir
+# RUN: not --crash %{brace-s3b7c-llc} \
+# RUN:   -start-after=brace-verify-final-byte-frame-publication \
+# RUN:   %t.publication.mir -o %t.publication.o 2>&1 | \
+# RUN:   FileCheck %s --check-prefix=UNREGISTERED-RESTART
+# RUN: test ! -s %t.publication.o
+# RUN: not --crash %{brace-s3b7c-llc} \
+# RUN:   -start-before=machine-opt-remark-emitter,2 \
+# RUN:   %t.publication.mir -o %t.start-before.o 2>&1 | \
+# RUN:   FileCheck %s --check-prefix=START-BEFORE
+# RUN: test ! -s %t.start-before.o
+#
+# Module initialization must run the target's complete IR gate before generic
+# AsmPrinter initialization can consume module asm.
+# RUN: awk '{ print } /^target triple =/ { print "module asm \"nop\"" }' \
+# RUN:   %S/s3b7c-direct-call-byte-frame.ll \
+# RUN:   > %t.module-asm.ll
+# RUN: not --crash %{brace-s3b7c-llc} %t.module-asm.ll \
+# RUN:   -o %t.module-asm.o 2>&1 | FileCheck %s --check-prefix=MODULE-ASM
+# RUN: test ! -s %t.module-asm.o
+# RUN: awk '{ print } /^  target triple =/ { \
+# RUN:   print "  module asm \"nop\"" }' %t.final.mir \
+# RUN:   > %t.final-module-asm.mir
+# RUN: not --crash %{brace-s3b7c-llc} \
+# RUN:   -start-after=brace-finalize-branches %t.final-module-asm.mir \
+# RUN:   -o %t.final-module-asm.o 2>&1 | \
+# RUN:   FileCheck %s --check-prefix=MODULE-ASM
+# RUN: test ! -s %t.final-module-asm.o
+#
+# A non-spill instruction may not smuggle the allocator's FixedStack PSV/MMO.
+# RUN: sed '/\$r4 = LOAD32.*volatile load/s/$/, (load (s32) from %%stack.0)/' \
+# RUN:   %t.ra.mir > %t.fixed-mmo.mir
+# RUN: not --crash %{brace-s3b7c-llc} -start-after=virtregrewriter \
+# RUN:   %t.fixed-mmo.mir -o %t.fixed-mmo.o 2>&1 | \
+# RUN:   FileCheck %s --check-prefix=FIXED-MMO
+# RUN: test ! -s %t.fixed-mmo.o
+#
+# HOME and a pre-existing semantic Frame operation are forbidden before the
+# independent FI-to-byte-frame finalizer runs.
+# RUN: sed 's/    SPILL_STORE32 \$r4, %%stack.0.*/    HOME_SAVE32 0, $r4/' \
+# RUN:   %t.ra.mir > %t.pre-home.mir
+# RUN: not --crash %{brace-s3b7c-llc} -start-after=virtregrewriter \
+# RUN:   %t.pre-home.mir -o %t.pre-home.o 2>&1 | \
+# RUN:   FileCheck %s --check-prefix=PRE-HOME
+# RUN: test ! -s %t.pre-home.o
+# RUN: sed 's/    SPILL_STORE32 \$r4, %%stack.0.*/    FRAME_STORE32 4, $r4/' \
+# RUN:   %t.ra.mir > %t.pre-frame.mir
+# RUN: not --crash %{brace-s3b7c-llc} -start-after=virtregrewriter \
+# RUN:   %t.pre-frame.mir -o %t.pre-frame.o 2>&1 | \
+# RUN:   FileCheck %s --check-prefix=PRE-FRAME
+# RUN: test ! -s %t.pre-frame.o
+#
+# The post-finalizer seam revalidates exact frame size/offset and rejects HOME.
+# RUN: sed 's/FRAME_ENTER 16/FRAME_ENTER 32/' %t.frame.mir > %t.size.mir
+# RUN: not --crash %{brace-s3b7c-llc} \
+# RUN:   -start-after=brace-finalize-byte-frame %t.size.mir -o %t.size.o \
+# RUN:   2>&1 | FileCheck %s --check-prefix=SIZE-REJECT
+# RUN: test ! -s %t.size.o
+# RUN: sed 's/FRAME_STORE32 4/FRAME_STORE32 0/' %t.frame.mir > %t.offset.mir
+# RUN: not --crash %{brace-s3b7c-llc} \
+# RUN:   -start-after=brace-finalize-byte-frame %t.offset.mir -o %t.offset.o \
+# RUN:   2>&1 | FileCheck %s --check-prefix=OFFSET-REJECT
+# RUN: test ! -s %t.offset.o
+# RUN: awk '{ print } /\$r4 = LOAD32/ { print "    HOME_SAVE32 0, $r4" }' \
+# RUN:   %t.frame.mir > %t.post-home.mir
+# RUN: not --crash %{brace-s3b7c-llc} \
+# RUN:   -start-after=brace-finalize-byte-frame %t.post-home.mir \
+# RUN:   -o %t.post-home.o 2>&1 | FileCheck %s --check-prefix=POST-HOME
+# RUN: test ! -s %t.post-home.o
+#
+# A post-final restart cannot restore a FrameIndex or FI-backed MMO, place a
+# Frame operation in the leaf, or split the exact Store/Call/Load lifecycle
+# across blocks.
+# RUN: %python %t.parts/post-forge.py fi %t.frame.mir %t.post-fi.mir
+# RUN: not --crash %{brace-s3b7c-llc} \
+# RUN:   -start-after=brace-finalize-byte-frame %t.post-fi.mir \
+# RUN:   -o %t.post-fi.o 2>&1 | FileCheck %s --check-prefix=POST-FI
+# RUN: test ! -s %t.post-fi.o
+# RUN: %python %t.parts/post-forge.py mmo %t.frame.mir %t.post-mmo.mir
+# RUN: not --crash %{brace-s3b7c-llc} \
+# RUN:   -start-after=brace-finalize-byte-frame %t.post-mmo.mir \
+# RUN:   -o %t.post-mmo.o 2>&1 | FileCheck %s --check-prefix=POST-MMO
+# RUN: test ! -s %t.post-mmo.o
+# RUN: %python %t.parts/post-forge.py leaf %t.frame.mir %t.leaf-frame.mir
+# RUN: not --crash %{brace-s3b7c-llc} \
+# RUN:   -start-after=brace-finalize-byte-frame %t.leaf-frame.mir \
+# RUN:   -o %t.leaf-frame.o 2>&1 | FileCheck %s --check-prefix=LEAF-FRAME
+# RUN: test ! -s %t.leaf-frame.o
+# RUN: %python %t.parts/post-forge.py split %t.frame.mir %t.cross-block.mir
+# RUN: not --crash %{brace-s3b7c-llc} \
+# RUN:   -start-after=brace-finalize-byte-frame %t.cross-block.mir \
+# RUN:   -o %t.cross-block.o 2>&1 | FileCheck %s --check-prefix=CROSS-BLOCK
+# RUN: test ! -s %t.cross-block.o
+#
+# The final publication verifier requires exact adjacency and requires the
+# Call result plus restored FrameLoad taint to meet in the same physical Store.
+# RUN: awk '/FRAME_STORE32 4, \$r4/ { save=$0; next } { print } \
+# RUN:   /CALL_I32/ { print save }' %t.final.mir > %t.store-after-call.mir
+# RUN: not --crash %{brace-s3b7c-llc} \
+# RUN:   -start-after=brace-finalize-branches %t.store-after-call.mir \
+# RUN:   -o %t.store-after-call.o 2>&1 | \
+# RUN:   FileCheck %s --check-prefix=ORDER-REJECT
+# RUN: test ! -s %t.store-after-call.o
+# RUN: sed 's/    \$r4 = AND32 killed \$r4, killed \$r5/    $r4 = MOV32 killed $r4/' \
+# RUN:   %t.final.mir > %t.only-call-result.mir
+# RUN: not --crash %{brace-s3b7c-llc} \
+# RUN:   -start-after=brace-finalize-branches %t.only-call-result.mir \
+# RUN:   -o %t.only-call-result.o 2>&1 | \
+# RUN:   FileCheck %s --check-prefix=JOINT-REJECT
+# RUN: test ! -s %t.only-call-result.o
+# RUN: sed '/    FRAME_LEAVE/d' %t.final.mir > %t.no-leave.mir
+# RUN: not --crash %{brace-s3b7c-llc} \
+# RUN:   -start-after=brace-finalize-branches %t.no-leave.mir \
+# RUN:   -o %t.no-leave.o 2>&1 | FileCheck %s --check-prefix=LEAVE-REJECT
+# RUN: test ! -s %t.no-leave.o
+#
+# Add a real CFG backedge into the root entry while preserving exactly one Call
+# and Return.  The target-owned entry-predecessor proof must fail first.
+# RUN: awk 'BEGIN { root=0; body=0; did_split=0 } \
+# RUN:   /^name:            brace_system_entry$/ { root=1 } \
+# RUN:   /^name:            brace_system_call_leaf$/ { root=0 } \
+# RUN:   root && /^body:/ { body=1 } \
+# RUN:   root && body && /^  bb\.0\.entry:$/ { print; \
+# RUN:     print "    successors: %bb.0(0x40000000), %bb.1(0x40000000)"; next } \
+# RUN:   root && body && !did_split && /\$r0 = PADDR_IMM 2147483652/ { \
+# RUN:     print "    BR_IF32 $r4, %bb.0, %bb.1"; print ""; \
+# RUN:     print "  bb.1:"; print "    liveins: $r4"; did_split=1 } \
+# RUN:   { print }' %t.final.mir > %t.entry-backedge.mir
+# RUN: not --crash %{brace-s3b7c-llc} \
+# RUN:   -start-after=brace-finalize-branches %t.entry-backedge.mir \
+# RUN:   -o %t.entry-backedge.o 2>&1 | \
+# RUN:   FileCheck %s --check-prefix=ENTRY-BACKEDGE
+# RUN: test ! -s %t.entry-backedge.o
+#
+# The entry-predecessor rule is identity-local.  A historical S3b.6 final-MIR
+# helper loop remains accepted with frozen bytes.  Independently, start from
+# the canonical new-selector, single-Return helper and add a real entry
+# backedge; retained IR remains valid so the target-owned CFG proof fails first.
+# RUN: sed 's/brace-system-s2-direct-call-r0/brace-system-s2-direct-call-home-r0/g' %S/s3b5-direct-call-helper-cfg.ll > %t.old-helper.ll
+# RUN: %{brace-s3b6-llc} -stop-after=brace-finalize-branches \
+# RUN:   %t.old-helper.ll -o %t.old-helper-final.mir
+# RUN: sed -e 's/successors: %bb.1(0x40000000), %bb.2(0x40000000)/successors: %bb.0(0x40000000), %bb.1(0x40000000)/' \
+# RUN:   -e 's/BR_IF32 killed \$r4, %bb.2, %bb.1/BR_IF32 killed $r4, %bb.0, %bb.1/' \
+# RUN:   -e '/  bb.2.if.else:/,/^...$/ { /^...$/!d; }' \
+# RUN:   %t.old-helper-final.mir > %t.old-helper-backedge.mir
+# RUN: %{brace-s3b6-llc} -start-after=brace-finalize-branches \
+# RUN:   %t.old-helper-backedge.mir -o %t.old-helper-backedge.o
+# RUN: %python -c "import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" %t.old-helper-backedge.o | FileCheck %s --check-prefix=OLD-BACKEDGE-SHA
+# RUN: awk 'BEGIN { helper=0; body=0; did_split=0 } \
+# RUN:   /^name:            brace_system_call_leaf$/ { helper=1 } \
+# RUN:   helper && /^body:/ { body=1 } \
+# RUN:   helper && body && /^  bb\.0\.entry:$/ { print; \
+# RUN:     print "    successors: %bb.0(0x40000000), %bb.1(0x40000000)"; next } \
+# RUN:   helper && body && !did_split && /\$r0 = PADDR_IMM 2147483656/ { \
+# RUN:     print "    BR_IF32 $r4, %bb.0, %bb.1"; print ""; \
+# RUN:     print "  bb.1:"; print "    liveins: $r4"; did_split=1 } \
+# RUN:   { print }' %t.final.mir > %t.new-helper-backedge.mir
+# RUN: not --crash %{brace-s3b7c-llc} \
+# RUN:   -start-after=brace-finalize-branches %t.new-helper-backedge.mir \
+# RUN:   -o %t.new-helper-backedge.o 2>&1 | \
+# RUN:   FileCheck %s --check-prefix=ENTRY-BACKEDGE
+# RUN: test ! -s %t.new-helper-backedge.o
+#
+# Preflight reserves both inserted operation/tick words before mutation:
+# 126+2 is exact, while 127+2 is rejected before FrameIndex removal.
+# RUN: awk 'BEGIN { root=0; added=0 } \
+# RUN:   /^name:            brace_system_entry$/ { root=1 } \
+# RUN:   /^name:            brace_system_call_leaf$/ { root=0 } \
+# RUN:   root && !added && /^  bb\.0\.entry:$/ { print; \
+# RUN:     for (i=0;i<117;i++) print "    $r5 = CONST32 0"; added=1; next } \
+# RUN:   { print }' %t.ra.mir > %t.exact-126.mir
+# RUN: %{brace-s3b7c-llc} -start-after=virtregrewriter %t.exact-126.mir \
+# RUN:   -o %t.exact-128.o
+# RUN: llvm-readobj --sections %t.exact-128.o | \
+# RUN:   FileCheck %s --check-prefix=EXACT-128
+# RUN: awk 'BEGIN { root=0; added=0 } \
+# RUN:   /^name:            brace_system_entry$/ { root=1 } \
+# RUN:   /^name:            brace_system_call_leaf$/ { root=0 } \
+# RUN:   root && !added && /^  bb\.0\.entry:$/ { print; \
+# RUN:     for (i=0;i<118;i++) print "    $r5 = CONST32 0"; added=1; next } \
+# RUN:   { print }' %t.ra.mir > %t.one-more-127.mir
+# RUN: not --crash %{brace-s3b7c-llc} -start-after=virtregrewriter \
+# RUN:   %t.one-more-127.mir -o %t.one-more.o 2>&1 | \
+# RUN:   FileCheck %s --check-prefix=ONE-MORE
+# RUN: test ! -s %t.one-more.o
+#
+# FIXED-MMO: LLVM ERROR: brace64 S3b.7c byte-frame finalizer: non-spill instruction carries a fixed-stack MMO
+# PRE-HOME: LLVM ERROR: brace64 S3b.7c byte-frame finalizer: semantic-home operation appeared in the byte-frame ABI
+# PRE-FRAME: LLVM ERROR: brace64 S3b.7c byte-frame finalizer: semantic byte-frame operation appeared before finalization
+# SIZE-REJECT: LLVM ERROR: brace64 S3b.7c post-byte-frame verifier: FrameEnter operand is not exact frame_size=16
+# OFFSET-REJECT: LLVM ERROR: brace64 S3b.7c post-byte-frame verifier: FrameStore32 operands are not exact offset=4/i32
+# POST-HOME: LLVM ERROR: brace64 S3b.7c post-byte-frame verifier: semantic-home operation
+# ORDER-REJECT: LLVM ERROR: brace64 S3b.7c post-byte-frame verifier: BF1 requires FrameStore32(4), Call, FrameLoad32(4) adjacency
+# JOINT-REJECT: LLVM ERROR: brace64 S3b.7c post-byte-frame verifier: Call result and FrameLoad32 do not jointly reach one physical store
+# LEAVE-REJECT: LLVM ERROR: brace64 S3b.7c post-byte-frame verifier: BF1 requires one Enter, Store32, Load32, and Leave
+# ENTRY-BACKEDGE: LLVM ERROR: brace64 S3b.7c post-byte-frame verifier: function entry block has a predecessor or backedge
+# OLD-BACKEDGE-SHA: 0e0843cb8ae46fc382ce1ce2a297dfd29f52b7e622167072118eb611d195eec8
+# EXACT-128: Name: .brace.text
+# EXACT-128: Size: 532
+# ONE-MORE: LLVM ERROR: brace64 S3b.7c byte-frame finalizer: FrameEnter/FrameLeave would exceed the 128-operation publication limit
+# FI1-INPUT-LABEL: name:            brace_system_entry
+# FI1-INPUT: stack:
+# FI1-INPUT-NEXT:  - { id: 0, type: spill-slot, offset: 0, size: 4, alignment: 4 }
+# FI1-INPUT-NEXT:  - { id: 1, name: '', type: spill-slot
+# FI1-INPUT: SPILL_STORE32 $r4, %stack.1 :: (store (s32) into %stack.1)
+# FI1-INPUT: $r5 = SPILL_LOAD32 %stack.1 :: (load (s32) from %stack.1)
+# FI-FINAL-LABEL: name:            brace_system_entry
+# FI-FINAL: stack:           []
+# FI-FINAL: FRAME_ENTER 16
+# FI-FINAL: FRAME_STORE32 4, $r4
+# FI-FINAL-NEXT: CALL_I32
+# FI-FINAL-NEXT: $r5 = FRAME_LOAD32 4
+# FI-FINAL-NOT: %stack.
+# FI-FINAL-LABEL: name:            brace_system_call_leaf
+# PIPELINE: Pass Arguments:
+# PIPELINE-SAME: -stack-slot-coloring
+# PIPELINE-SAME: -machineverifier -brace-finalize-byte-frame -machineverifier -brace-verify-post-byte-frame
+# PIPELINE-SAME: -stack-frame-layout -machineverifier -brace-finalize-branches -machineverifier -brace-verify-final-byte-frame-publication
+# BOOKKEEPING-MULTIPLE: LLVM ERROR: brace64 S3b.7c byte-frame finalizer: multiple live spill objects have no canonical transfer pseudo
+# BOOKKEEPING-SHAPE: LLVM ERROR: brace64 S3b.7c byte-frame finalizer: restart bookkeeping is not one exact leading inert i32 spill record
+# NO-SPILL: LLVM ERROR: brace64 S3b.7c byte-frame finalizer: BF1 retained IR requires exactly one i32 call-live spill
+# NO-FRAME: LLVM ERROR: brace64 S3b.7c post-byte-frame verifier: BF1 retained IR requires one semantic frame
+# NO-FRAME-MMO-FIRST: LLVM ERROR: brace64 S3b.7c post-byte-frame verifier: fixed-stack MMO survived finalization
+# FINAL-NO-FRAME: LLVM ERROR: brace64 S3b.7c final-publication verifier: BF1 retained IR requires one semantic frame
+# UNREGISTERED-RESTART: LLVM ERROR: brace64 S3b.7c byte-frame selector: -start-after=brace-verify-final-byte-frame-publication is not one of the five registered restart seams
+# START-BEFORE: LLVM ERROR: brace64 S3b.7c byte-frame selector: -start-before=machine-opt-remark-emitter,2 is not an admitted restart boundary
+# MODULE-ASM: LLVM ERROR: brace64 S3b.5 direct-call ABI: globals, aliases, ifuncs, and module asm are not admitted
+# POST-FI: LLVM ERROR: brace64 S3b.7c post-byte-frame verifier: FrameIndex survived finalization
+# POST-MMO: LLVM ERROR: brace64 S3b.7c post-byte-frame verifier: fixed-stack MMO survived finalization
+# LEAF-FRAME: LLVM ERROR: brace64 S3b.7c post-byte-frame verifier: helper must have frame_size=0 and exactly one valued Return
+# CROSS-BLOCK: LLVM ERROR: brace64 S3b.7c post-byte-frame verifier: BF1 Store32(4)/Call/Load32(4) order is not exact
+
+#--- renumber.py
+from pathlib import Path
+import sys
+
+assert len(sys.argv) == 4
+dead_count = int(sys.argv[1])
+assert dead_count in (1, 2)
+source = Path(sys.argv[2]).read_text()
+root_marker = "name:            brace_system_entry\n"
+leaf_marker = "name:            brace_system_call_leaf\n"
+assert source.count(root_marker) == 1
+assert source.count(leaf_marker) == 1
+root_start = source.index(root_marker)
+root_end = source.index(leaf_marker, root_start)
+root = source[root_start:root_end]
+stack_start = root.index("stack:\n")
+stack_end = root.index("entry_values:", stack_start)
+stack = root[stack_start:stack_end]
+lines = stack.splitlines(keepends=True)
+anchors = [i for i, line in enumerate(lines)
+           if line.startswith("  - { id: 0, name: '', type: spill-slot,")]
+assert anchors == [1]
+assert sum(line.startswith("  - { id:") for line in lines) == 1
+live = lines[1].replace("id: 0", f"id: {dead_count}", 1)
+bookkeeping = [
+    f"  - {{ id: {i}, type: spill-slot, offset: 0, size: 4, alignment: 4 }}\n"
+    for i in range(dead_count)
+]
+lines[1:2] = bookkeeping + [live]
+root = root[:stack_start] + "".join(lines) + root[stack_end:]
+body_start = root.index("body:")
+assert root[:body_start].count("%stack.0") == 0
+assert root[body_start:].count("%stack.0") == 4
+root = root[:body_start] + root[body_start:].replace(
+    "%stack.0", f"%stack.{dead_count}")
+assert root[body_start:].count(f"%stack.{dead_count}") == 4
+result = source[:root_start] + root + source[root_end:]
+Path(sys.argv[3]).write_text(result)
+
+#--- remove-frame.py
+from pathlib import Path
+import sys
+
+assert len(sys.argv) == 4
+mode = sys.argv[1]
+assert mode in ("pre", "post", "post-mmo")
+source = Path(sys.argv[2]).read_text()
+root_marker = "name:            brace_system_entry\n"
+leaf_marker = "name:            brace_system_call_leaf\n"
+assert source.count(root_marker) == 1
+assert source.count(leaf_marker) == 1
+root_start = source.index(root_marker)
+root_end = source.index(leaf_marker, root_start)
+root = source[root_start:root_end]
+
+def remove_exact_line(text, line):
+    exact = line + "\n"
+    assert text.count(exact) == 1
+    return text.replace(exact, "", 1)
+
+if mode == "pre":
+    stack_start = root.index("stack:\n")
+    stack_end = root.index("entry_values:", stack_start)
+    stack = root[stack_start:stack_end]
+    assert stack.count("type: spill-slot") == 1
+    root = root[:stack_start] + "stack:           []\n" + root[stack_end:]
+    root = remove_exact_line(
+        root,
+        "    SPILL_STORE32 $r4, %stack.0 :: (store (s32) into %stack.0)")
+    root = remove_exact_line(
+        root,
+        "    $r5 = SPILL_LOAD32 %stack.0 :: (load (s32) from %stack.0)")
+else:
+    assert root.count("stack:           []\n") == 1
+    root = remove_exact_line(root, "    FRAME_ENTER 16")
+    root = remove_exact_line(root, "    FRAME_STORE32 4, $r4")
+    root = remove_exact_line(root, "    $r5 = FRAME_LOAD32 4")
+    root = remove_exact_line(root, "    FRAME_LEAVE")
+
+joint = "    $r4 = AND32 killed $r4, killed $r5\n"
+assert root.count(joint) == 1
+root = root.replace(joint, "    $r4 = MOV32 killed $r4\n", 1)
+assert "FRAME_" not in root
+if mode == "post-mmo":
+    empty = "stack:           []\n"
+    assert root.count(empty) == 1
+    record = ("stack:\n"
+              "  - { id: 0, type: spill-slot, offset: 0, size: 4, "
+              "alignment: 4 }\n")
+    root = root.replace(empty, record, 1)
+    load = next(line for line in root.splitlines(keepends=True)
+                if line.startswith("    $r4 = LOAD32 killed $r0 :: "))
+    assert root.count(load) == 1
+    root = root.replace(
+        load, load.rstrip("\n") + ", (load (s32) from %stack.0)\n", 1)
+    assert root.count("%stack.0") == 1
+else:
+    assert "%stack." not in root
+Path(sys.argv[3]).write_text(source[:root_start] + root + source[root_end:])
+
+#--- post-forge.py
+from pathlib import Path
+import sys
+
+assert len(sys.argv) == 4
+mode = sys.argv[1]
+assert mode in ("fi", "mmo", "leaf", "split")
+source = Path(sys.argv[2]).read_text()
+root_marker = "name:            brace_system_entry\n"
+leaf_marker = "name:            brace_system_call_leaf\n"
+assert source.count(root_marker) == 1
+assert source.count(leaf_marker) == 1
+root_start = source.index(root_marker)
+leaf_start = source.index(leaf_marker, root_start)
+root = source[root_start:leaf_start]
+leaf = source[leaf_start:]
+
+def add_root_stack(text):
+    empty = "stack:           []\n"
+    assert text.count(empty) == 1
+    record = ("stack:\n"
+              "  - { id: 0, type: spill-slot, offset: 0, size: 4, "
+              "alignment: 4 }\n")
+    return text.replace(empty, record, 1)
+
+if mode == "fi":
+    root = add_root_stack(root)
+    old = "    FRAME_STORE32 4, $r4\n"
+    assert root.count(old) == 1
+    root = root.replace(old, "    FRAME_STORE32 %stack.0, $r4\n", 1)
+elif mode == "mmo":
+    root = add_root_stack(root)
+    old = "    FRAME_STORE32 4, $r4\n"
+    new = ("    FRAME_STORE32 4, $r4 :: "
+           "(store (s32) into %stack.0)\n")
+    assert root.count(old) == 1
+    root = root.replace(old, new, 1)
+elif mode == "leaf":
+    anchor = "    $r0 = PADDR_IMM 2147483656\n"
+    assert leaf.count(anchor) == 1
+    leaf = leaf.replace(anchor, "    FRAME_ENTER 16\n" + anchor, 1)
+else:
+    header = "  bb.0.entry:\n"
+    call = "    CALL_I32 @brace_system_call_leaf, csr_noregs, implicit-def $r4, implicit $r4\n"
+    assert root.count(header) == 1
+    assert root.count(call) == 1
+    root = root.replace(
+        header,
+        header + "    successors: %bb.1(0x80000000)\n\n",
+        1)
+    root = root.replace(
+        call,
+        "  bb.1:\n    liveins: $r4\n\n" + call,
+        1)
+
+Path(sys.argv[3]).write_text(source[:root_start] + root + leaf)

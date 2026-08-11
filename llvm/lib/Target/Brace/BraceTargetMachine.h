@@ -19,7 +19,14 @@ class TargetLoweringObjectFile;
 
 class BraceTargetMachine final : public CodeGenTargetMachineImpl {
 public:
-  enum class SdagABIKind { None, Leaf, LeafHome, DirectCall, DirectCallHome };
+  enum class SdagABIKind {
+    None,
+    Leaf,
+    LeafHome,
+    DirectCall,
+    DirectCallHome,
+    DirectCallByteFrame
+  };
 
 private:
   BraceSubtarget Subtarget;
@@ -38,6 +45,10 @@ public:
   const BraceSubtarget *getSubtargetImpl(const Function &) const override {
     return &Subtarget;
   }
+
+  MachineFunctionInfo *
+  createMachineFunctionInfo(BumpPtrAllocator &Allocator, const Function &F,
+                            const TargetSubtargetInfo *STI) const override;
 
   TargetPassConfig *createPassConfig(PassManagerBase &PM) override;
 
@@ -63,11 +74,15 @@ public:
   bool usesSdagDirectCallHomeABI() const {
     return SdagABI == SdagABIKind::DirectCallHome;
   }
+  bool usesSdagDirectCallByteFrameABI() const {
+    return SdagABI == SdagABIKind::DirectCallByteFrame;
+  }
   bool usesSdagSpillHomes() const {
     return usesSdagLeafHomeABI() || usesSdagDirectCallHomeABI();
   }
   bool usesSdagDirectCalls() const {
-    return usesSdagDirectCallABI() || usesSdagDirectCallHomeABI();
+    return usesSdagDirectCallABI() || usesSdagDirectCallHomeABI() ||
+           usesSdagDirectCallByteFrameABI();
   }
   StringRef getSdagABIName() const;
   bool isMachineVerifierClean() const override { return true; }

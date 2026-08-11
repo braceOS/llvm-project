@@ -84,6 +84,7 @@ constexpr uint64_t DirectDescriptorSize = 24;
 constexpr uint64_t DirectSectionCount = 11;
 constexpr uint32_t DirectExperimentalFlags = UINT32_C(0x42520200);
 constexpr uint32_t DirectHomeExperimentalFlags = UINT32_C(0x42520300);
+constexpr uint32_t DirectByteFrameExperimentalFlags = UINT32_C(0x42520400);
 
 constexpr char DirectSectionNames[] =
     "\0.brace.target\0.brace.functions\0.brace.types\0.brace.literals\0"
@@ -321,6 +322,14 @@ Expected<uint32_t> directEncodingOpcode(unsigned MCOpcode) {
     return UINT32_C(16);
   if (MCOpcode == S2_RETURN_VALUE)
     return UINT32_C(20);
+  if (MCOpcode == S2_FRAME_ENTER)
+    return UINT32_C(25);
+  if (MCOpcode == S2_FRAME_LOAD)
+    return UINT32_C(26);
+  if (MCOpcode == S2_FRAME_STORE)
+    return UINT32_C(27);
+  if (MCOpcode == S2_FRAME_LEAVE)
+    return UINT32_C(28);
   return encodingOpcode(MCOpcode);
 }
 
@@ -406,8 +415,9 @@ Error S2TargetStreamer::setHeader(ArrayRef<uint8_t> Types, uint32_t EntryBlock,
 
 Error S2TargetStreamer::beginDirectFunction(
     uint32_t FunctionIndex, ArrayRef<uint8_t> Types, uint32_t EntryOperation,
-    uint32_t ResultKind, ArrayRef<uint8_t> ParameterSlots,
-    ArrayRef<uint32_t> BlockStarts, uint64_t Base) {
+    uint32_t ResultKind, uint32_t FrameSizeBytes,
+    ArrayRef<uint8_t> ParameterSlots, ArrayRef<uint32_t> BlockStarts,
+    uint64_t Base) {
   if (HasHeader)
     return fail("direct function follows a legacy header");
   if (FunctionIndex > 1)
@@ -423,6 +433,8 @@ Error S2TargetStreamer::beginDirectFunction(
       return fail("direct function parameter slot is out of range");
   if (ResultKind > 4)
     return fail("direct function result kind is out of range");
+  if (FrameSizeBytes > 256 || (FrameSizeBytes != 0 && FrameSizeBytes % 16 != 0))
+    return fail("direct function frame size is not canonical");
   if (!DirectFunctions.empty() && RelocationBase != Base)
     return fail("direct functions disagree on relocation base");
   if (DirectFunctions.size() <= FunctionIndex)
@@ -435,6 +447,7 @@ Error S2TargetStreamer::beginDirectFunction(
   Function.BlockStarts.assign(BlockStarts.begin(), BlockStarts.end());
   Function.Entry = EntryOperation;
   Function.ResultKind = ResultKind;
+  Function.FrameSizeBytes = FrameSizeBytes;
   Function.Present = true;
   RelocationBase = Base;
   CurrentDirectFunction = FunctionIndex;
@@ -757,7 +770,9 @@ Error S2ObjectWriter::writeExact(ArrayRef<uint8_t> RegisterTypes,
 Error S2ObjectWriter::writeDirectCallExact(ArrayRef<S2DirectFunction> Functions,
                                            uint32_t EntryFunction,
                                            uint64_t RelocationBase) {
-  if (Mode != S2ObjectMode::DirectCall && Mode != S2ObjectMode::DirectCallHome)
+  if (Mode != S2ObjectMode::DirectCall &&
+      Mode != S2ObjectMode::DirectCallHome &&
+      Mode != S2ObjectMode::DirectCallByteFrame)
     return fail("direct-call write used with the legacy writer mode");
   if (Functions.size() != 2 || EntryFunction != 0 || !Functions[0].Present ||
       !Functions[1].Present)
@@ -768,6 +783,7 @@ Error S2ObjectWriter::writeDirectCallExact(ArrayRef<S2DirectFunction> Functions,
   constexpr std::array<uint8_t, 7> RequiredHomeTypes{PADDR, PADDR, I8, I8,
                                                      I32,   I32,   I32};
   const bool DirectCallHome = Mode == S2ObjectMode::DirectCallHome;
+  const bool DirectCallByteFrame = Mode == S2ObjectMode::DirectCallByteFrame;
   const bool ExactTypes =
       DirectCallHome
           ? (Functions[0].RegisterTypes == ArrayRef<uint8_t>(RequiredTypes) ||
@@ -781,6 +797,15 @@ Error S2ObjectWriter::writeDirectCallExact(ArrayRef<S2DirectFunction> Functions,
       Functions[1].ParameterSlots != ArrayRef<uint8_t>({4}) ||
       Functions[1].ResultKind != 2)
     return fail("direct-call functions do not have the exact S3b.5 signature");
+  if (DirectCallByteFrame) {
+    if ((Functions[0].FrameSizeBytes != 0 &&
+         Functions[0].FrameSizeBytes != 16) ||
+        Functions[1].FrameSizeBytes != 0)
+      return fail("S3b.7c compiler profile requires BF0 or root frame 16");
+  } else if (Functions[0].FrameSizeBytes != 0 ||
+             Functions[1].FrameSizeBytes != 0) {
+    return fail("older direct-call identity carries a frame declaration");
+  }
 
   uint64_t RegisterCount = 0;
   uint64_t OperationCount = 0;
@@ -896,6 +921,11 @@ Error S2ObjectWriter::writeDirectCallExact(ArrayRef<S2DirectFunction> Functions,
       return llvm::binary_search(Function.BlockStarts,
                                  static_cast<uint32_t>(OperationIndex));
     };
+    auto BlockForOperation = [&](unsigned OperationIndex) {
+      auto Next = llvm::upper_bound(Function.BlockStarts, OperationIndex);
+      return static_cast<unsigned>(
+          std::distance(Function.BlockStarts.begin(), Next) - 1);
+    };
     SmallVector<uint32_t, 128> ReadMasks(FunctionSize, 0);
     SmallVector<uint32_t, 128> DefinitionMasks(FunctionSize, 0);
     SmallVector<uint32_t, 128> DerivedInputMasks(FunctionSize, 0);
@@ -910,6 +940,8 @@ Error S2ObjectWriter::writeDirectCallExact(ArrayRef<S2DirectFunction> Functions,
     std::optional<unsigned> CallOperation;
     std::optional<unsigned> SaveOperation;
     std::optional<unsigned> RestoreOperation;
+    std::optional<unsigned> FrameEnterOperation;
+    std::optional<unsigned> FrameLeaveOperation;
     unsigned ReturnCount = 0;
 
     auto Read = [&](unsigned OperationIndex, uint64_t Register) -> Error {
@@ -999,6 +1031,9 @@ Error S2ObjectWriter::writeDirectCallExact(ArrayRef<S2DirectFunction> Functions,
           if (ResidentOnly)
             DerivedInputMasks[OperationIndex] =
                 (UINT32_C(1) << *Left) | (UINT32_C(1) << *Right);
+        } else if (DirectCallByteFrame) {
+          DerivedInputMasks[OperationIndex] =
+              (UINT32_C(1) << *Left) | (UINT32_C(1) << *Right);
         }
         if (Error E = Read(OperationIndex, *Left))
           return E;
@@ -1010,6 +1045,69 @@ Error S2ObjectWriter::writeDirectCallExact(ArrayRef<S2DirectFunction> Functions,
           return E;
         break;
       }
+      case S2_FRAME_ENTER:
+        if (!DirectCallByteFrame || FunctionIndex != 0 ||
+            Function.FrameSizeBytes != 16 || FrameEnterOperation ||
+            OperationIndex != Function.Entry)
+          return fail("invalid S3b.7c FrameEnter placement");
+        if (Error E = requireOperands(Inst, 0))
+          return E;
+        FrameEnterOperation = OperationIndex;
+        break;
+      case S2_FRAME_LOAD: {
+        if (!DirectCallByteFrame || FunctionIndex != 0 ||
+            Function.FrameSizeBytes != 16 || RestoreOperation)
+          return fail("invalid S3b.7c FrameLoad placement");
+        if (Error E = requireOperands(Inst, 3))
+          return E;
+        auto Destination = operand(Inst, 0);
+        auto Offset = operand(Inst, 1);
+        auto Width = operand(Inst, 2);
+        if (!Destination || !Offset || !Width)
+          return joinErrors(Destination.takeError(),
+                            joinErrors(Offset.takeError(), Width.takeError()));
+        if (*Width != U32 || *Offset != 4 || !HasType(*Destination, I32) ||
+            !IsResident(*Destination))
+          return fail("S3b.7c FrameLoad32 operands are not exact");
+        Payload = static_cast<uint32_t>(*Destination | (*Width << 5) |
+                                        (*Offset << 6));
+        if (Error E = Define(OperationIndex, *Destination))
+          return E;
+        RestoreOperation = OperationIndex;
+        RestoreDefinitionMasks[OperationIndex] = UINT32_C(1) << *Destination;
+        break;
+      }
+      case S2_FRAME_STORE: {
+        if (!DirectCallByteFrame || FunctionIndex != 0 ||
+            Function.FrameSizeBytes != 16 || SaveOperation)
+          return fail("invalid S3b.7c FrameStore placement");
+        if (Error E = requireOperands(Inst, 3))
+          return E;
+        auto Offset = operand(Inst, 0);
+        auto Source = operand(Inst, 1);
+        auto Width = operand(Inst, 2);
+        if (!Offset || !Source || !Width)
+          return joinErrors(Offset.takeError(),
+                            joinErrors(Source.takeError(), Width.takeError()));
+        if (*Width != U32 || *Offset != 4 || !HasType(*Source, I32) ||
+            !IsResident(*Source))
+          return fail("S3b.7c FrameStore32 operands are not exact");
+        if (Error E = Read(OperationIndex, *Source))
+          return E;
+        Payload =
+            static_cast<uint32_t>(*Width | (*Source << 1) | (*Offset << 6));
+        SaveOperation = OperationIndex;
+        SaveReadMasks[OperationIndex] = UINT32_C(1) << *Source;
+        break;
+      }
+      case S2_FRAME_LEAVE:
+        if (!DirectCallByteFrame || FunctionIndex != 0 ||
+            Function.FrameSizeBytes != 16 || FrameLeaveOperation)
+          return fail("invalid S3b.7c FrameLeave placement");
+        if (Error E = requireOperands(Inst, 0))
+          return E;
+        FrameLeaveOperation = OperationIndex;
+        break;
       case S2_DIRECT_CALL: {
         if (FunctionIndex != 0 || ++CallCount != 1)
           return fail("direct call is outside the exact root profile");
@@ -1146,7 +1244,7 @@ Error S2ObjectWriter::writeDirectCallExact(ArrayRef<S2DirectFunction> Functions,
                                         (*Address << 6));
         if (Error E = Define(OperationIndex, *Destination))
           return E;
-        if (DirectCallHome && *Width == U32)
+        if ((DirectCallHome || DirectCallByteFrame) && *Width == U32)
           PhysicalLoadDefinitionMasks[OperationIndex] = UINT32_C(1)
                                                         << *Destination;
         break;
@@ -1173,7 +1271,7 @@ Error S2ObjectWriter::writeDirectCallExact(ArrayRef<S2DirectFunction> Functions,
           return E;
         if (Error E = Read(OperationIndex, *Source))
           return E;
-        if (DirectCallHome)
+        if (DirectCallHome || DirectCallByteFrame)
           ObservableReadMasks[OperationIndex] = UINT32_C(1) << *Source;
         Payload =
             static_cast<uint32_t>(*Width | (*Address << 1) | (*Source << 6));
@@ -1207,11 +1305,38 @@ Error S2ObjectWriter::writeDirectCallExact(ArrayRef<S2DirectFunction> Functions,
       if (!H1 && (SaveOperation || RestoreOperation))
         return fail("direct-call H0 contains a home transfer");
     }
+    if (DirectCallByteFrame) {
+      if (ReturnCount != 1)
+        return fail("S3b.7c function requires exactly one Return");
+      if (!Predecessors[Function.Entry].empty())
+        return fail("S3b.7c entry operation has a predecessor or backedge");
+      if (FunctionIndex == 0 && Function.FrameSizeBytes == 16) {
+        if (!FrameEnterOperation || !SaveOperation || !CallOperation ||
+            !RestoreOperation || !FrameLeaveOperation ||
+            *FrameEnterOperation != Function.Entry ||
+            *SaveOperation + 1 != *CallOperation ||
+            *CallOperation + 1 != *RestoreOperation ||
+            *FrameLeaveOperation + 1 >= FunctionSize ||
+            Function.Instructions[*FrameLeaveOperation + 1].getOpcode() !=
+                S2_RETURN ||
+            BlockForOperation(*FrameEnterOperation) != 0 ||
+            BlockForOperation(*SaveOperation) !=
+                BlockForOperation(*CallOperation) ||
+            BlockForOperation(*CallOperation) !=
+                BlockForOperation(*RestoreOperation) ||
+            BlockForOperation(*FrameLeaveOperation) !=
+                BlockForOperation(*FrameLeaveOperation + 1))
+          return fail("S3b.7c BF1 frame lifecycle is not exact");
+      } else if (FrameEnterOperation || SaveOperation || RestoreOperation ||
+                 FrameLeaveOperation) {
+        return fail("S3b.7c zero-frame function contains a Frame operation");
+      }
+    }
 
-    // The streamer carries the actual non-debug MachineBasicBlock boundaries
-    // as target-private transient metadata.  Independently validate those
-    // boundaries against the flattened operations and derive every explicit
-    // or implicit-fallthrough block edge before publication.
+    // BlockStarts is the target-owned MachineBasicBlock-to-serialized-word
+    // mapping.  Validate it against the flattened operation/tick carriers and
+    // derive every explicit or implicit-fallthrough block edge before
+    // publication.
     const uint64_t FunctionBlockCount = Function.BlockStarts.size();
     uint64_t FunctionEdgeCount = 0;
     for (unsigned BlockIndex = 0; BlockIndex != Function.BlockStarts.size();
@@ -1304,45 +1429,61 @@ Error S2ObjectWriter::writeDirectCallExact(ArrayRef<S2DirectFunction> Functions,
       if ((ReadMasks[OperationIndex] & ~In[OperationIndex]) != 0)
         return fail("direct-call register is read before definition");
 
-    if (DirectCallHome && FunctionIndex == 0 && RestoreOperation) {
+    if ((DirectCallHome || DirectCallByteFrame) && FunctionIndex == 0 &&
+        RestoreOperation) {
       struct HomeFlowState {
         uint32_t Tainted = 0;
+        uint32_t CallTainted = 0;
         uint32_t LoadDerived = 0;
         bool Observed = false;
+        bool JointlyObserved = false;
         bool SavedLoad = false;
 
         bool operator==(const HomeFlowState &Other) const {
-          return Tainted == Other.Tainted && LoadDerived == Other.LoadDerived &&
-                 Observed == Other.Observed && SavedLoad == Other.SavedLoad;
+          return Tainted == Other.Tainted && CallTainted == Other.CallTainted &&
+                 LoadDerived == Other.LoadDerived &&
+                 Observed == Other.Observed &&
+                 JointlyObserved == Other.JointlyObserved &&
+                 SavedLoad == Other.SavedLoad;
         }
       };
       auto TransferHomeFlow = [&](unsigned OperationIndex,
                                   HomeFlowState State) {
         if ((ObservableReadMasks[OperationIndex] & State.Tainted) != 0)
           State.Observed = true;
+        if ((ObservableReadMasks[OperationIndex] & State.Tainted &
+             State.CallTainted) != 0)
+          State.JointlyObserved = true;
         if ((SaveReadMasks[OperationIndex] & State.LoadDerived) != 0)
           State.SavedLoad = true;
         uint32_t ResultTaint = 0;
+        uint32_t ResultCallTaint = 0;
         uint32_t ResultLoadDerived = 0;
         if ((DerivedInputMasks[OperationIndex] & State.Tainted) != 0)
           ResultTaint = DefinitionMasks[OperationIndex];
         if ((DerivedInputMasks[OperationIndex] & State.LoadDerived) != 0)
           ResultLoadDerived = DefinitionMasks[OperationIndex];
+        if ((DerivedInputMasks[OperationIndex] & State.CallTainted) != 0)
+          ResultCallTaint = DefinitionMasks[OperationIndex];
         State.Tainted &= ~DefinitionMasks[OperationIndex];
         State.Tainted |= ResultTaint;
+        State.CallTainted &= ~DefinitionMasks[OperationIndex];
+        State.CallTainted |= ResultCallTaint;
         State.LoadDerived &= ~DefinitionMasks[OperationIndex];
         State.LoadDerived |= ResultLoadDerived;
         State.LoadDerived |= PhysicalLoadDefinitionMasks[OperationIndex];
         State.Tainted |= RestoreDefinitionMasks[OperationIndex];
         if (CallTransfers[OperationIndex]) {
           State.Tainted &= ~UINT32_C(0x3f);
+          State.CallTainted &= ~UINT32_C(0x3f);
+          State.CallTainted |= DefinitionMasks[OperationIndex];
           State.LoadDerived &= ~UINT32_C(0x3f);
         }
         return State;
       };
 
-      constexpr HomeFlowState Universal{UINT32_C(0x3f), UINT32_C(0x3f), true,
-                                        true};
+      constexpr HomeFlowState Universal{
+          UINT32_C(0x3f), UINT32_C(0x3f), UINT32_C(0x3f), true, true, true};
       SmallVector<HomeFlowState, 128> FlowIn(FunctionSize, Universal);
       SmallVector<HomeFlowState, 128> FlowOut(FunctionSize, Universal);
       FlowIn[Function.Entry] = {};
@@ -1362,8 +1503,11 @@ Error S2ObjectWriter::writeDirectCallExact(ArrayRef<S2DirectFunction> Functions,
               return fail("direct-call non-entry operation has no predecessor");
             for (unsigned Predecessor : Predecessors[OperationIndex]) {
               NewIn.Tainted &= FlowOut[Predecessor].Tainted;
+              NewIn.CallTainted &= FlowOut[Predecessor].CallTainted;
               NewIn.LoadDerived &= FlowOut[Predecessor].LoadDerived;
               NewIn.Observed = NewIn.Observed && FlowOut[Predecessor].Observed;
+              NewIn.JointlyObserved =
+                  NewIn.JointlyObserved && FlowOut[Predecessor].JointlyObserved;
               NewIn.SavedLoad =
                   NewIn.SavedLoad && FlowOut[Predecessor].SavedLoad;
             }
@@ -1381,10 +1525,14 @@ Error S2ObjectWriter::writeDirectCallExact(ArrayRef<S2DirectFunction> Functions,
            ++OperationIndex)
         if (Function.Instructions[OperationIndex].getOpcode() == S2_RETURN &&
             (!FlowOut[OperationIndex].SavedLoad ||
-             !FlowOut[OperationIndex].Observed))
+             !(DirectCallByteFrame ? FlowOut[OperationIndex].JointlyObserved
+                                   : FlowOut[OperationIndex].Observed)))
           return fail(!FlowOut[OperationIndex].SavedLoad
                           ? "saved home does not originate from a physical "
                             "i32 load"
+                      : DirectCallByteFrame
+                          ? "Call result and FrameLoad do not jointly reach "
+                            "one observable physical store"
                           : "restored home does not reach an observable "
                             "physical store");
     }
@@ -1503,8 +1651,9 @@ Error S2ObjectWriter::writeDirectCallExact(ArrayRef<S2DirectFunction> Functions,
   storeU32(Bytes, 20, 1);
   storeU64(Bytes, 40, L.SectionHeadersOffset);
   storeU32(Bytes, 48,
-           DirectCallHome ? DirectHomeExperimentalFlags
-                          : DirectExperimentalFlags);
+           DirectCallByteFrame ? DirectByteFrameExperimentalFlags
+           : DirectCallHome    ? DirectHomeExperimentalFlags
+                               : DirectExperimentalFlags);
   storeU16(Bytes, 52, 64);
   storeU16(Bytes, 58, 64);
   storeU16(Bytes, 60, DirectSectionCount);
@@ -1533,6 +1682,7 @@ Error S2ObjectWriter::writeDirectCallExact(ArrayRef<S2DirectFunction> Functions,
     storeU32(Bytes, Record, Function.Entry);
     storeU32(Bytes, Record + 4, Function.ResultKind);
     storeU32(Bytes, Record + 8, Function.ParameterSlots.size());
+    storeU32(Bytes, Record + 12, Function.FrameSizeBytes);
     for (unsigned Parameter = 0; Parameter != 4; ++Parameter)
       storeU32(Bytes, Record + 16 + Parameter * 4,
                Parameter < Function.ParameterSlots.size()

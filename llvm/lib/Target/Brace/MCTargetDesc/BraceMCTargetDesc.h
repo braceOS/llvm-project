@@ -48,6 +48,7 @@ enum class S2ObjectMode : uint8_t {
   Legacy,
   DirectCall,
   DirectCallHome,
+  DirectCallByteFrame,
 };
 
 struct S2DirectFunction final {
@@ -57,6 +58,7 @@ struct S2DirectFunction final {
   SmallVector<uint32_t, 4> BlockStarts;
   uint32_t Entry = 0;
   uint32_t ResultKind = 0;
+  uint32_t FrameSizeBytes = 0;
   bool Present = false;
 };
 
@@ -93,6 +95,7 @@ public:
   Error setHeader(ArrayRef<uint8_t> Types, uint32_t EntryBlock, uint64_t Base);
   Error beginDirectFunction(uint32_t FunctionIndex, ArrayRef<uint8_t> Types,
                             uint32_t EntryOperation, uint32_t ResultKind,
+                            uint32_t FrameSizeBytes,
                             ArrayRef<uint8_t> ParameterSlots,
                             ArrayRef<uint32_t> BlockStarts, uint64_t Base);
   Error emitInstruction(const MCInst &Inst);

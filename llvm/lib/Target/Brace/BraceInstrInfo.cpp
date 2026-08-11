@@ -21,16 +21,18 @@ BraceInstrInfo::BraceInstrInfo(const BraceSubtarget &STI)
 
 namespace {
 
-bool usesSpillHomes(const MachineFunction &MF) {
+bool usesFinalizedSpillStorage(const MachineFunction &MF) {
   const StringRef ABI = MF.getTarget().Options.MCOptions.getABIName();
   return ABI == BraceSdagLeafHomeABIName ||
-         ABI == BraceSdagDirectCallHomeABIName;
+         ABI == BraceSdagDirectCallHomeABIName ||
+         ABI == BraceSdagDirectCallByteFrameABIName;
 }
 
 bool allowsPAddrRematerialization(const MachineFunction &MF) {
   const StringRef ABI = MF.getTarget().Options.MCOptions.getABIName();
   return ABI == BraceSdagLeafHomeABIName || ABI == BraceSdagDirectCallABIName ||
-         ABI == BraceSdagDirectCallHomeABIName;
+         ABI == BraceSdagDirectCallHomeABIName ||
+         ABI == BraceSdagDirectCallByteFrameABIName;
 }
 
 unsigned spillStoreOpcode(const TargetRegisterClass *RC) {
@@ -136,7 +138,7 @@ void BraceInstrInfo::storeRegToStackSlot(
     bool IsKill, int FrameIndex, const TargetRegisterClass *RC, Register,
     MachineInstr::MIFlag Flags) const {
   MachineFunction &MF = *MBB.getParent();
-  if (!usesSpillHomes(MF))
+  if (!usesFinalizedSpillStorage(MF))
     report_fatal_error("brace64 S3b.3 leaf ABI register pressure would spill");
   const unsigned Opcode = spillStoreOpcode(RC);
   if (!Opcode)
@@ -164,7 +166,7 @@ void BraceInstrInfo::loadRegFromStackSlot(MachineBasicBlock &MBB,
                                           Register, unsigned SubReg,
                                           MachineInstr::MIFlag Flags) const {
   MachineFunction &MF = *MBB.getParent();
-  if (!usesSpillHomes(MF))
+  if (!usesFinalizedSpillStorage(MF))
     report_fatal_error("brace64 S3b.3 leaf ABI register pressure would reload");
   const unsigned Opcode = spillLoadOpcode(RC);
   if (!Opcode || SubReg != 0)

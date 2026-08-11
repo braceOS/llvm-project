@@ -10,6 +10,7 @@ add_public_tablegen_target(BraceCommonTableGen)
 add_llvm_target(BraceCodeGen
   BraceAsmPrinter.cpp
   BraceFinalizeBranches.cpp
+  BraceFinalizeByteFrame.cpp
   BraceFinalizeSpillHomes.cpp
   BraceFrameLowering.cpp
   BraceInstrInfo.cpp

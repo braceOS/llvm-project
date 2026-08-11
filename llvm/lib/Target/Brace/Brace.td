@@ -60,6 +60,12 @@ def S2_PHYSICAL_LOAD : S2MCInst<"s2.physical-load",
     (ins S2Imm:$destination, S2Imm:$width, S2Imm:$address)>;
 def S2_PHYSICAL_STORE : S2MCInst<"s2.physical-store",
     (ins S2Imm:$width, S2Imm:$address, S2Imm:$source)>;
+def S2_FRAME_ENTER : S2MCInst<"s2.frame-enter", (ins)>;
+def S2_FRAME_LOAD : S2MCInst<"s2.frame-load",
+    (ins S2Imm:$destination, S2Imm:$offset, S2Imm:$width)>;
+def S2_FRAME_STORE : S2MCInst<"s2.frame-store",
+    (ins S2Imm:$offset, S2Imm:$source, S2Imm:$width)>;
+def S2_FRAME_LEAVE : S2MCInst<"s2.frame-leave", (ins)>;
 
 def BraceImm8 : Operand<i8>;
 def BraceImm32 : Operand<i32>;
@@ -67,6 +73,8 @@ def BraceImm64 : Operand<i64>;
 def BraceMBB : Operand<OtherVT>;
 def BraceFrameIndex : Operand<i64>;
 def BraceHome : Operand<i32>;
+def BraceFrameOffset : Operand<i32>;
+def BraceFrameSize : Operand<i32>;
 def BraceCallTarget : Operand<i64>;
 
 class BraceMI<dag outs, dag ins, string mnemonic> : Instruction {
@@ -142,6 +150,29 @@ let isPseudo = 1, hasSideEffects = 1 in {
   def HOME_RESTORE32
       : BraceMI<(outs I32Regs:$dst), (ins BraceHome:$home),
                 "home_restore32 $dst, $home">;
+}
+
+// S3b.7c finalizer-only semantic Guest byte-frame operations.  FRAME_ENTER's
+// size is the target-owned carrier for the serialized function-record
+// frame_size_bytes field.  FRAME_ENTER and FRAME_LEAVE each publish one
+// semantic operation/tick word whose opcode payload remains zero.  No
+// FrameIndex or fixed-stack MMO survives into this publication form.
+let isPseudo = 1, hasSideEffects = 1 in {
+  def FRAME_ENTER
+      : BraceMI<(outs), (ins BraceFrameSize:$size), "frame_enter $size">;
+  def FRAME_LEAVE : BraceMI<(outs), (ins), "frame_leave">;
+}
+
+let isPseudo = 1, mayLoad = 1, hasSideEffects = 1 in {
+  def FRAME_LOAD32
+      : BraceMI<(outs I32Regs:$dst), (ins BraceFrameOffset:$offset),
+                "frame_load32 $dst, $offset">;
+}
+
+let isPseudo = 1, mayStore = 1, hasSideEffects = 1 in {
+  def FRAME_STORE32
+      : BraceMI<(outs), (ins BraceFrameOffset:$offset, I32Regs:$src),
+                "frame_store32 $offset, $src">;
 }
 
 let mayLoad = 1, hasSideEffects = 1 in {

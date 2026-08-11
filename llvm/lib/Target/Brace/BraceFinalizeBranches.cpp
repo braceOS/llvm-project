@@ -43,6 +43,15 @@ namespace {
   report_fatal_error("brace64 S3b.6 post-home verifier: " + Message);
 }
 
+[[noreturn]] void rejectDirectByteFrame(const Twine &Message) {
+  report_fatal_error("brace64 S3b.7c post-byte-frame verifier: " + Message);
+}
+
+[[noreturn]] void rejectFinalByteFrame(const Twine &Message) {
+  report_fatal_error(
+      "brace64 S3b.7c final-publication verifier: " + Message);
+}
+
 bool isInteger8(Register Reg) { return Brace::I8RegsRegClass.contains(Reg); }
 
 bool isInteger32(Register Reg) { return Brace::I32RegsRegClass.contains(Reg); }
@@ -208,7 +217,7 @@ void finalizeConditionalBranch(MachineBasicBlock &MBB,
 }
 
 void verifyInstruction(const MachineInstr &MI, bool AllowsHomes,
-                       bool DirectCall = false) {
+                       bool DirectCall = false, bool ByteFrame = false) {
   if (DirectCall && MI.getOpcode() == Brace::CALL_I32)
     verifyDirectCallEnvelope(MI);
   else
@@ -235,6 +244,11 @@ void verifyInstruction(const MachineInstr &MI, bool AllowsHomes,
     const int64_t Home = MI.getOperand(Index).getImm();
     if (Home < 0 || Home > 19)
       reject("semantic-home ordinal is outside 0..19");
+  };
+  auto requireFrameOffset = [&](unsigned Index) {
+    requireImm(Index);
+    if (MI.getOperand(Index).getImm() != 4)
+      rejectDirectByteFrame("compiler frame byte offset is not exact 4");
   };
   auto requireCount = [&](unsigned Count) {
     if (MI.getNumExplicitOperands() != Count)
@@ -331,6 +345,41 @@ void verifyInstruction(const MachineInstr &MI, bool AllowsHomes,
     requireCount(2);
     requireReg(0, isInteger32, /*IsDef=*/true);
     requireHome(1);
+    break;
+  case Brace::FRAME_ENTER:
+    if (!ByteFrame)
+      reject("byte-frame operation is outside the S3b.7c ABI");
+    requireCount(1);
+    requireImm(0);
+    if (MI.getOperand(0).getImm() != 16)
+      rejectDirectByteFrame("FrameEnter size is not exact 16");
+    if (!MI.memoperands_empty())
+      rejectDirectByteFrame("FrameEnter carries an LLVM MMO");
+    break;
+  case Brace::FRAME_LOAD32:
+    if (!ByteFrame)
+      reject("byte-frame operation is outside the S3b.7c ABI");
+    requireCount(2);
+    requireReg(0, isInteger32, /*IsDef=*/true);
+    requireFrameOffset(1);
+    if (!MI.memoperands_empty())
+      rejectDirectByteFrame("FrameLoad carries an LLVM MMO");
+    break;
+  case Brace::FRAME_STORE32:
+    if (!ByteFrame)
+      reject("byte-frame operation is outside the S3b.7c ABI");
+    requireCount(2);
+    requireFrameOffset(0);
+    requireReg(1, isInteger32, /*IsDef=*/false);
+    if (!MI.memoperands_empty())
+      rejectDirectByteFrame("FrameStore carries an LLVM MMO");
+    break;
+  case Brace::FRAME_LEAVE:
+    if (!ByteFrame)
+      reject("byte-frame operation is outside the S3b.7c ABI");
+    requireCount(0);
+    if (!MI.memoperands_empty())
+      rejectDirectByteFrame("FrameLeave carries an LLVM MMO");
     break;
   case Brace::LOAD8:
     requireCount(2);
@@ -691,7 +740,7 @@ void verifyHomeDefinitions(MachineFunction &MF) {
       reject("every published semantic home requires both save and restore");
 }
 
-void verifyDirectCallHomeResultFlow(MachineFunction &MF) {
+void verifyDirectCallResultFlow(MachineFunction &MF, bool ByteFrame) {
   // This is deliberately a MachineFunction-local reconstruction.  The exact
   // S2 writer performs its own operation-table analysis and is not authority
   // for a final-MIR restart that must fail at the publication seam itself.
@@ -700,6 +749,9 @@ void verifyDirectCallHomeResultFlow(MachineFunction &MF) {
   constexpr uint8_t Consumed = UINT8_C(1) << 2;
   constexpr uint8_t Overwritten = UINT8_C(1) << 3;
   constexpr uint8_t RepeatedCall = UINT8_C(1) << 4;
+  auto Reject = [&](const Twine &Message) {
+    ByteFrame ? rejectDirectByteFrame(Message) : rejectDirectHome(Message);
+  };
 
   auto TransferInstruction = [&](const MachineInstr &MI, uint8_t State) {
     if (MI.getOpcode() == Brace::CALL_I32) {
@@ -742,7 +794,7 @@ void verifyDirectCallHomeResultFlow(MachineFunction &MF) {
   unsigned Iterations = 0;
   while (Changed) {
     if (++Iterations > 32)
-      rejectDirectHome("direct-call result-flow analysis did not converge");
+      Reject("direct-call result-flow analysis did not converge");
     Changed = false;
     for (const MachineBasicBlock &MBB : MF) {
       uint8_t NewIn = &MBB == &MF.front() ? BeforeCall : 0;
@@ -762,13 +814,11 @@ void verifyDirectCallHomeResultFlow(MachineFunction &MF) {
     for (const MachineInstr &MI : MBB) {
       State = TransferInstruction(MI, State);
       if ((State & RepeatedCall) != 0)
-        rejectDirectHome("entry direct call can execute more than once");
+        Reject("entry direct call can execute more than once");
       if ((State & Overwritten) != 0)
-        rejectDirectHome(
-            "direct-call result is overwritten before consumption");
+        Reject("direct-call result is overwritten before consumption");
       if (MI.getOpcode() == Brace::RET && State != Consumed)
-        rejectDirectHome(
-            "direct-call result is not consumed on every root exit path");
+        Reject("direct-call result is not consumed on every root exit path");
     }
   }
 }
@@ -801,7 +851,7 @@ void verifyDirectCallHomeCompilerShape(MachineFunction &MF) {
   }
   if (MF.getName() != "brace_system_entry" || !Call)
     rejectDirectHome("unexpected function or missing direct call");
-  verifyDirectCallHomeResultFlow(MF);
+  verifyDirectCallResultFlow(MF, /*ByteFrame=*/false);
   if (HomeOperationCount == 0)
     return;
   if (HomeOperationCount != 2 || !Save || !Restore ||
@@ -930,6 +980,222 @@ void verifyDirectCallHomeCompilerShape(MachineFunction &MF) {
   }
 }
 
+void verifyDirectCallByteFrameCompilerShape(MachineFunction &MF) {
+  const MachineInstr *Call = nullptr;
+  const MachineInstr *Enter = nullptr;
+  const MachineInstr *Store = nullptr;
+  const MachineInstr *Load = nullptr;
+  const MachineInstr *Leave = nullptr;
+  const MachineInstr *Return = nullptr;
+  unsigned FrameOperationCount = 0;
+  unsigned CallCount = 0;
+  unsigned VoidReturnCount = 0;
+  unsigned ValueReturnCount = 0;
+  for (const MachineBasicBlock &MBB : MF)
+    for (const MachineInstr &MI : MBB) {
+      switch (MI.getOpcode()) {
+      case Brace::CALL_I32:
+        Call = Call ? nullptr : &MI;
+        ++CallCount;
+        break;
+      case Brace::FRAME_ENTER:
+        Enter = Enter ? nullptr : &MI;
+        ++FrameOperationCount;
+        break;
+      case Brace::FRAME_STORE32:
+        Store = Store ? nullptr : &MI;
+        ++FrameOperationCount;
+        break;
+      case Brace::FRAME_LOAD32:
+        Load = Load ? nullptr : &MI;
+        ++FrameOperationCount;
+        break;
+      case Brace::FRAME_LEAVE:
+        Leave = Leave ? nullptr : &MI;
+        ++FrameOperationCount;
+        break;
+      case Brace::RET:
+        Return = Return ? nullptr : &MI;
+        ++VoidReturnCount;
+        break;
+      case Brace::RET_I32:
+        ++ValueReturnCount;
+        break;
+      default:
+        break;
+      }
+    }
+
+  if (!MF.front().pred_empty())
+    rejectDirectByteFrame("function entry block has a predecessor or backedge");
+  if (MF.getName() == "brace_system_call_leaf") {
+    if (FrameOperationCount != 0 || CallCount != 0 || VoidReturnCount != 0 ||
+        ValueReturnCount != 1)
+      rejectDirectByteFrame(
+          "helper must have frame_size=0 and exactly one valued Return");
+    return;
+  }
+  if (MF.getName() != "brace_system_entry" || CallCount != 1 || !Call ||
+      VoidReturnCount != 1 || !Return || ValueReturnCount != 0)
+    rejectDirectByteFrame("unexpected function, Call, or Return shape");
+  verifyDirectCallResultFlow(MF, /*ByteFrame=*/true);
+  if (FrameOperationCount == 0)
+    return;
+  if (FrameOperationCount != 4 || !Enter || !Store || !Load || !Leave)
+    rejectDirectByteFrame("BF1 requires one Enter, Store32, Load32, and Leave");
+  const auto First = nextReal(MF.front(), MF.front().begin());
+  if (First == MF.front().end() || &*First != Enter ||
+      Enter->getOperand(0).getImm() != 16)
+    rejectDirectByteFrame("FrameEnter(16) is not the first root operation");
+  if (Store->getOperand(0).getImm() != 4 || Load->getOperand(1).getImm() != 4 ||
+      Store->getNextNode() != Call || Call->getNextNode() != Load)
+    rejectDirectByteFrame(
+        "BF1 requires FrameStore32(4), Call, FrameLoad32(4) adjacency");
+  if (Leave->getNextNode() != Return)
+    rejectDirectByteFrame(
+        "FrameLeave must immediately precede the root Return");
+
+  struct FrameFlowState {
+    uint8_t FrameTainted = 0;
+    uint8_t CallTainted = 0;
+    uint8_t LoadDerived = 0;
+    bool JointlyObserved = false;
+    bool SavedLoad = false;
+
+    bool operator==(const FrameFlowState &Other) const {
+      return FrameTainted == Other.FrameTainted &&
+             CallTainted == Other.CallTainted &&
+             LoadDerived == Other.LoadDerived &&
+             JointlyObserved == Other.JointlyObserved &&
+             SavedLoad == Other.SavedLoad;
+    }
+  };
+  auto Transfer = [](const MachineBasicBlock &MBB, FrameFlowState State) {
+    for (const MachineInstr &MI : MBB) {
+      if (MI.getOpcode() == Brace::STORE8 || MI.getOpcode() == Brace::STORE32) {
+        const uint8_t Source = registerBit(MI.getOperand(1).getReg());
+        if ((State.FrameTainted & Source) != 0 &&
+            (State.CallTainted & Source) != 0)
+          State.JointlyObserved = true;
+      }
+      if (MI.getOpcode() == Brace::FRAME_STORE32 &&
+          (State.LoadDerived & registerBit(MI.getOperand(1).getReg())) != 0)
+        State.SavedLoad = true;
+
+      uint8_t FrameDerived = 0;
+      uint8_t CallDerived = 0;
+      uint8_t LoadDerived = 0;
+      switch (MI.getOpcode()) {
+      case Brace::AND8:
+      case Brace::AND32:
+        if ((State.FrameTainted & registerBit(MI.getOperand(1).getReg())) !=
+                0 ||
+            (State.FrameTainted & registerBit(MI.getOperand(2).getReg())) != 0)
+          FrameDerived = registerBit(MI.getOperand(0).getReg());
+        if ((State.CallTainted & registerBit(MI.getOperand(1).getReg())) != 0 ||
+            (State.CallTainted & registerBit(MI.getOperand(2).getReg())) != 0)
+          CallDerived = registerBit(MI.getOperand(0).getReg());
+        if ((State.LoadDerived & registerBit(MI.getOperand(1).getReg())) != 0 ||
+            (State.LoadDerived & registerBit(MI.getOperand(2).getReg())) != 0)
+          LoadDerived = registerBit(MI.getOperand(0).getReg());
+        break;
+      case Brace::MOV8:
+      case Brace::MOV32:
+        if ((State.FrameTainted & registerBit(MI.getOperand(1).getReg())) != 0)
+          FrameDerived = registerBit(MI.getOperand(0).getReg());
+        if ((State.CallTainted & registerBit(MI.getOperand(1).getReg())) != 0)
+          CallDerived = registerBit(MI.getOperand(0).getReg());
+        if ((State.LoadDerived & registerBit(MI.getOperand(1).getReg())) != 0)
+          LoadDerived = registerBit(MI.getOperand(0).getReg());
+        break;
+      default:
+        break;
+      }
+
+      if (MI.getOpcode() == Brace::CALL_I32) {
+        State.FrameTainted = 0;
+        State.CallTainted = registerBit(Brace::R4);
+        State.LoadDerived = 0;
+        continue;
+      }
+      for (const MachineOperand &Operand : MI.operands())
+        if (Operand.isReg() && Operand.isDef()) {
+          State.FrameTainted &=
+              static_cast<uint8_t>(~registerBit(Operand.getReg()));
+          State.CallTainted &=
+              static_cast<uint8_t>(~registerBit(Operand.getReg()));
+          State.LoadDerived &=
+              static_cast<uint8_t>(~registerBit(Operand.getReg()));
+        }
+      State.FrameTainted |= FrameDerived;
+      State.CallTainted |= CallDerived;
+      State.LoadDerived |= LoadDerived;
+      if (MI.getOpcode() == Brace::LOAD32)
+        State.LoadDerived |= registerBit(MI.getOperand(0).getReg());
+      if (MI.getOpcode() == Brace::FRAME_LOAD32)
+        State.FrameTainted |= registerBit(MI.getOperand(0).getReg());
+    }
+    return State;
+  };
+
+  constexpr FrameFlowState Universal{UINT8_C(0x3f), UINT8_C(0x3f),
+                                     UINT8_C(0x3f), true, true};
+  DenseMap<const MachineBasicBlock *, FrameFlowState> In;
+  DenseMap<const MachineBasicBlock *, FrameFlowState> Out;
+  for (const MachineBasicBlock &MBB : MF) {
+    const FrameFlowState Initial =
+        &MBB == &MF.front() ? FrameFlowState{} : Universal;
+    In[&MBB] = Initial;
+    Out[&MBB] = Transfer(MBB, Initial);
+  }
+  bool Changed = true;
+  unsigned Iterations = 0;
+  while (Changed) {
+    if (++Iterations > 32)
+      rejectDirectByteFrame("byte-frame observable-flow did not converge");
+    Changed = false;
+    for (const MachineBasicBlock &MBB : MF) {
+      FrameFlowState NewIn{};
+      if (&MBB != &MF.front()) {
+        NewIn = Universal;
+        bool HasPredecessor = false;
+        for (const MachineBasicBlock *Predecessor : MBB.predecessors()) {
+          NewIn.FrameTainted &= Out[Predecessor].FrameTainted;
+          NewIn.CallTainted &= Out[Predecessor].CallTainted;
+          NewIn.LoadDerived &= Out[Predecessor].LoadDerived;
+          NewIn.JointlyObserved =
+              NewIn.JointlyObserved && Out[Predecessor].JointlyObserved;
+          NewIn.SavedLoad = NewIn.SavedLoad && Out[Predecessor].SavedLoad;
+          HasPredecessor = true;
+        }
+        if (!HasPredecessor)
+          rejectDirectByteFrame(
+              "non-entry block has no frame-flow predecessor");
+      }
+      const FrameFlowState NewOut = Transfer(MBB, NewIn);
+      if (!(In[&MBB] == NewIn) || !(Out[&MBB] == NewOut)) {
+        In[&MBB] = NewIn;
+        Out[&MBB] = NewOut;
+        Changed = true;
+      }
+    }
+  }
+  for (const MachineBasicBlock &MBB : MF) {
+    const MachineInstr *Last = MBB.getLastNonDebugInstr() == MBB.end()
+                                   ? nullptr
+                                   : &*MBB.getLastNonDebugInstr();
+    if (!Last || Last->getOpcode() != Brace::RET)
+      continue;
+    if (!Out[&MBB].SavedLoad)
+      rejectDirectByteFrame(
+          "FrameStore32 source does not originate from a physical i32 load");
+    if (!Out[&MBB].JointlyObserved)
+      rejectDirectByteFrame(
+          "Call result and FrameLoad32 do not jointly reach one physical "
+          "store");
+  }
+}
+
 void transferPAddrDefinitions(const MachineBasicBlock &MBB, PAddrState &State,
                               bool DirectCall) {
   if (!State.Reachable)
@@ -1026,7 +1292,7 @@ void verifyPAddrReachingDefinitions(MachineFunction &MF, bool DirectCall) {
 }
 
 void verifyMachineFunctionEnvelope(MachineFunction &MF, bool AllowsHomes,
-                                   bool DirectCall) {
+                                   bool DirectCall, bool ByteFrame) {
   const bool IsEntry = MF.getName() == "brace_system_entry";
   const bool IsHelper = MF.getName() == "brace_system_call_leaf";
   if ((!DirectCall && !IsEntry) || (DirectCall && !IsEntry && !IsHelper))
@@ -1073,10 +1339,10 @@ void verifyMachineFunctionEnvelope(MachineFunction &MF, bool AllowsHomes,
       Frame.hasCopyImplyingStackAdjustment() ||
       Frame.hasMustTailInVarArgFunc() || Frame.hasTailCall())
     reject("stack, frame, return-address, and call state are forbidden");
-  if (!AllowsHomes &&
+  if (!AllowsHomes && !ByteFrame &&
       (Frame.getNumObjects() != 0 || Frame.getMaxAlign() != Align(1)))
     reject("S3b.3 leaf publication requires an exact empty frame");
-  if (AllowsHomes) {
+  if (AllowsHomes || ByteFrame) {
     if (Frame.getMaxAlign() > Align(4))
       reject("spill-home frame metadata exceeds i32 alignment");
     for (int FI = Frame.getObjectIndexBegin(); FI != Frame.getObjectIndexEnd();
@@ -1105,7 +1371,7 @@ void verifyMachineFunctionEnvelope(MachineFunction &MF, bool AllowsHomes,
 }
 
 void verifyFinalMachineFunctionContents(MachineFunction &MF, bool AllowsHomes,
-                                        bool DirectCall) {
+                                        bool DirectCall, bool ByteFrame) {
   const bool IsEntry = MF.getName() == "brace_system_entry";
   const bool IsHelper = MF.getName() == "brace_system_call_leaf";
   unsigned OperationCount = 0;
@@ -1138,13 +1404,15 @@ void verifyFinalMachineFunctionContents(MachineFunction &MF, bool AllowsHomes,
     for (const MachineInstr &MI : MBB) {
       if (MI.isDebugInstr())
         reject("debug MachineInstr are not publishable");
-      verifyInstruction(MI, AllowsHomes, DirectCall);
+      verifyInstruction(MI, AllowsHomes, DirectCall, ByteFrame);
       CallCount += MI.getOpcode() == Brace::CALL_I32;
       VoidReturnCount += MI.getOpcode() == Brace::RET;
       ValueReturnCount += MI.getOpcode() == Brace::RET_I32;
       if (MI.isTerminator() && &MI != Last)
         reject("a terminator may only be the final operation in its block");
-      if (MI.mayLoad() || MI.mayStore()) {
+      if ((MI.mayLoad() || MI.mayStore()) &&
+          MI.getOpcode() != Brace::FRAME_LOAD32 &&
+          MI.getOpcode() != Brace::FRAME_STORE32) {
         if (++MemoryCount > 64)
           DirectCall
               ? rejectDirect(
@@ -1202,6 +1470,8 @@ void verifyFinalMachineFunctionContents(MachineFunction &MF, bool AllowsHomes,
                      (IsHelper && (CallCount != 0 || VoidReturnCount != 0 ||
                                    ValueReturnCount == 0))))
     rejectDirect("function Call/Return profile is not exact");
+  if (ByteFrame && IsEntry && VoidReturnCount != 1)
+    rejectDirectByteFrame("root requires exactly one void Return");
   verifyRegisterDefinitions(
       MF, DirectCall && IsHelper ? registerBit(Brace::R4) : 0, DirectCall);
   if (AllowsHomes)
@@ -1212,6 +1482,7 @@ void verifyFinalMachineFunctionContents(MachineFunction &MF, bool AllowsHomes,
 class BraceFinalizeBranchesLegacy final : public MachineFunctionPass {
   bool AllowsHomes = false;
   bool DirectCall = false;
+  bool ByteFrame = false;
   std::string RequiredABI = BraceSdagLeafABIName.str();
 
 public:
@@ -1219,8 +1490,9 @@ public:
   BraceFinalizeBranchesLegacy() : MachineFunctionPass(ID) {}
   explicit BraceFinalizeBranchesLegacy(const BraceTargetMachine &TM)
       : MachineFunctionPass(ID), AllowsHomes(TM.usesSdagSpillHomes()),
-        DirectCall(TM.usesSdagDirectCalls()), RequiredABI(TM.getSdagABIName()) {
-  }
+        DirectCall(TM.usesSdagDirectCalls()),
+        ByteFrame(TM.usesSdagDirectCallByteFrameABI()),
+        RequiredABI(TM.getSdagABIName()) {}
 
   bool runOnMachineFunction(MachineFunction &MF) override {
     // MIR restart seams skip the ordinary IR pass pipeline.  Recheck the
@@ -1242,7 +1514,7 @@ public:
     // In particular, an instruction-free lexical entry must not be able to
     // launder live-in, EH, section, alignment, or address-taken state by being
     // erased before the publication trust boundary observes it.
-    verifyMachineFunctionEnvelope(MF, AllowsHomes, DirectCall);
+    verifyMachineFunctionEnvelope(MF, AllowsHomes, DirectCall, ByteFrame);
 
     const auto &TII = *MF.getSubtarget<BraceSubtarget>().getInstrInfo();
     // SelectionDAG can preserve an instruction-free IR entry block when its
@@ -1276,7 +1548,7 @@ public:
     }
 
     verifyBraceS3FinalMachineFunctionEnvelope(MF, AllowsHomes, DirectCall,
-                                              RequiredABI);
+                                              ByteFrame, RequiredABI);
     return Changed;
   }
 
@@ -1285,25 +1557,94 @@ public:
   }
 };
 
+class BraceVerifyFinalByteFramePublicationLegacy final
+    : public MachineFunctionPass {
+  std::optional<bool> RootRequiresFrameIntent;
+
+public:
+  static char ID;
+  BraceVerifyFinalByteFramePublicationLegacy() : MachineFunctionPass(ID) {}
+
+  void getAnalysisUsage(AnalysisUsage &AU) const override {
+    AU.setPreservesAll();
+    MachineFunctionPass::getAnalysisUsage(AU);
+  }
+
+  bool doInitialization(Module &M) override {
+    // This pass is itself the final serializable-boundary owner.  Its module
+    // initialization runs before AsmPrinter initialization even when an
+    // admitted MIR restart has skipped the ordinary target IR ModulePass.
+    RootRequiresFrameIntent =
+        verifyBraceS3ByteFrameIRAndRequiresRootFrame(M);
+    return false;
+  }
+
+  bool runOnMachineFunction(MachineFunction &MF) override {
+    if (MF.getTarget().Options.MCOptions.getABIName() !=
+        BraceSdagDirectCallByteFrameABIName)
+      rejectFinalByteFrame("pass ran outside its exact codegen profile");
+    if (!RootRequiresFrameIntent)
+      rejectFinalByteFrame("module initialization did not run");
+    verifyBraceS3FinalMachineFunctionEnvelope(
+        MF, /*AllowsHomes=*/false, /*DirectCall=*/true, /*ByteFrame=*/true,
+        BraceSdagDirectCallByteFrameABIName);
+    const bool HasFrame = llvm::any_of(MF, [](const MachineBasicBlock &MBB) {
+      return llvm::any_of(MBB, [](const MachineInstr &MI) {
+        return MI.getOpcode() == Brace::FRAME_ENTER ||
+               MI.getOpcode() == Brace::FRAME_LOAD32 ||
+               MI.getOpcode() == Brace::FRAME_STORE32 ||
+               MI.getOpcode() == Brace::FRAME_LEAVE;
+      });
+    });
+    if (MF.getName() == "brace_system_entry" &&
+        *RootRequiresFrameIntent != HasFrame)
+      *RootRequiresFrameIntent
+          ? rejectFinalByteFrame(
+                "BF1 retained IR requires one semantic frame")
+          : rejectFinalByteFrame(
+                "BF0 retained IR requires an empty semantic frame");
+    MF.getInfo<BraceMachineFunctionInfo>()
+        ->markFinalByteFramePublicationVerified();
+    return false;
+  }
+
+  StringRef getPassName() const override {
+    return "Brace S3b.7c final-publication verifier";
+  }
+};
+
 } // namespace
 
-void llvm::verifyBraceS3FinalMachineFunctionEnvelope(
-    MachineFunction &MF, bool AllowsHomes, bool DirectCall,
-    StringRef RequiredABI) {
+void llvm::verifyBraceS3FinalMachineFunctionEnvelope(MachineFunction &MF,
+                                                     bool AllowsHomes,
+                                                     bool DirectCall,
+                                                     bool ByteFrame,
+                                                     StringRef RequiredABI) {
   verifyBraceS3LateModuleEnvelope(*MF.getFunction().getParent(), RequiredABI);
-  verifyMachineFunctionEnvelope(MF, AllowsHomes, DirectCall);
-  verifyFinalMachineFunctionContents(MF, AllowsHomes, DirectCall);
+  verifyMachineFunctionEnvelope(MF, AllowsHomes, DirectCall, ByteFrame);
+  verifyFinalMachineFunctionContents(MF, AllowsHomes, DirectCall, ByteFrame);
   if (RequiredABI == BraceSdagDirectCallHomeABIName)
     verifyDirectCallHomeCompilerShape(MF);
+  if (RequiredABI == BraceSdagDirectCallByteFrameABIName)
+    verifyDirectCallByteFrameCompilerShape(MF);
 }
 
 char BraceFinalizeBranchesLegacy::ID = 0;
+char BraceVerifyFinalByteFramePublicationLegacy::ID = 0;
 
 INITIALIZE_PASS(BraceFinalizeBranchesLegacy, DEBUG_TYPE,
                 "Brace finalize branches and publication verifier", false,
                 false)
 
+INITIALIZE_PASS(BraceVerifyFinalByteFramePublicationLegacy,
+                "brace-verify-final-byte-frame-publication",
+                "Brace S3b.7c final-publication verifier", false, false)
+
 FunctionPass *
 llvm::createBraceFinalizeBranchesPass(const BraceTargetMachine &TM) {
   return new BraceFinalizeBranchesLegacy(TM);
+}
+
+FunctionPass *llvm::createBraceVerifyFinalByteFramePublicationPass() {
+  return new BraceVerifyFinalByteFramePublicationLegacy();
 }

@@ -17,7 +17,9 @@ BraceTargetLowering::BraceTargetLowering(const BraceTargetMachine &TM,
     : TargetLowering(TM, STI),
       DirectCallABI(
           TM.Options.MCOptions.getABIName() == BraceSdagDirectCallABIName ||
-          TM.Options.MCOptions.getABIName() == BraceSdagDirectCallHomeABIName) {
+          TM.Options.MCOptions.getABIName() == BraceSdagDirectCallHomeABIName ||
+          TM.Options.MCOptions.getABIName() ==
+              BraceSdagDirectCallByteFrameABIName) {
   addRegisterClass(MVT::i8, &Brace::I8RegsRegClass);
   addRegisterClass(MVT::i32, &Brace::I32RegsRegClass);
   addRegisterClass(MVT::i64, &Brace::PAddrRegsRegClass);

@@ -14,6 +14,26 @@
 // RUN:   -nostdinc -c -emit-llvm \
 // RUN:   -mabi=brace-system-s2-direct-call-home-r0 %s 2>&1 | \
 // RUN:   FileCheck -check-prefix=CALL-HOME-ABI %s
+// RUN: %clang -### --target=brace64-unknown-none-elf -ffreestanding \
+// RUN:   -nostdinc -c -emit-llvm \
+// RUN:   -mabi=brace-system-s2-direct-call-byte-frame-r0 %s 2>&1 | \
+// RUN:   FileCheck -check-prefix=CALL-BYTE-FRAME-ABI %s
+// RUN: not %clang -### --target=brace64-unknown-none-elf -ffreestanding \
+// RUN:   -nostdinc -c -emit-llvm \
+// RUN:   -mabi=brace-system-s2-direct-call-byte-frame-r0 \
+// RUN:   -mabi=brace-system-s2-direct-call-byte-frame-r0 %s 2>&1 | \
+// RUN:   FileCheck -check-prefix=BYTE-FRAME-DUPLICATE %s
+// RUN: not %clang -### --target=brace64-unknown-none-elf -ffreestanding \
+// RUN:   -nostdinc -c -emit-llvm \
+// RUN:   -mabi=brace-system-s2-direct-call-byte-frame-r0 \
+// RUN:   -mabi=brace-system-s2-direct-call-home-r0 %s 2>&1 | \
+// RUN:   FileCheck -check-prefix=BYTE-FRAME-DUPLICATE %s
+// RUN: not %clang -### --target=brace64-unknown-none-elf -ffreestanding \
+// RUN:   -nostdinc -c -emit-llvm \
+// RUN:   -mabi=brace-system-s2-direct-call-byte-frame-r0 \
+// RUN:   -Xclang -target-abi \
+// RUN:   -Xclang brace-system-s2-direct-call-byte-frame-r0 %s 2>&1 | \
+// RUN:   FileCheck -check-prefix=XCLANG-ABI %s
 // RUN: not %clang -### --target=brace64-unknown-none-elf -ffreestanding \
 // RUN:   -nostdinc -c -emit-llvm -mabi=not-brace %s 2>&1 | \
 // RUN:   FileCheck -check-prefix=BAD-ABI %s
@@ -67,7 +87,13 @@
 // CALL-HOME-ABI-SAME: "-triple" "brace64-unknown-none-elf"
 // CALL-HOME-ABI-SAME: "-target-abi" "brace-system-s2-direct-call-home-r0"
 
+// CALL-BYTE-FRAME-ABI: "-cc1"
+// CALL-BYTE-FRAME-ABI-SAME: "-triple" "brace64-unknown-none-elf"
+// CALL-BYTE-FRAME-ABI-SAME: "-target-abi" "brace-system-s2-direct-call-byte-frame-r0"
+
 // BAD-ABI: error: unsupported argument 'not-brace' to option '-mabi='
+
+// BYTE-FRAME-DUPLICATE: error: unsupported option '-mabi=brace-system-s2-direct-call-byte-frame-r0' for target 'brace64-unknown-none-elf'
 
 // XCLANG-ABI: error: unsupported option '-Xclang -target-abi' for target 'brace64-unknown-none-elf'
 

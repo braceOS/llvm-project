@@ -13,6 +13,7 @@
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/ErrorHandling.h"
 #include <algorithm>
 #include <array>
 #include <optional>
@@ -28,6 +29,7 @@ class BraceAsmPrinter final : public AsmPrinter {
   bool AllowsHomes;
   bool DirectCall;
   bool DirectCallHome;
+  bool DirectCallByteFrame;
 
 public:
   static char ID;
@@ -37,8 +39,9 @@ public:
         AllowsHomes(static_cast<BraceTargetMachine &>(TM).usesSdagSpillHomes()),
         DirectCall(static_cast<BraceTargetMachine &>(TM).usesSdagDirectCalls()),
         DirectCallHome(
-            static_cast<BraceTargetMachine &>(TM).usesSdagDirectCallHomeABI()) {
-  }
+            static_cast<BraceTargetMachine &>(TM).usesSdagDirectCallHomeABI()),
+        DirectCallByteFrame(static_cast<BraceTargetMachine &>(TM)
+                                .usesSdagDirectCallByteFrameABI()) {}
 
   StringRef getPassName() const override {
     return "Brace S3b.3 S2 Assembly Printer";
@@ -67,11 +70,14 @@ bool BraceAsmPrinter::doInitialization(Module &M) {
   // Legacy pass managers initialize every FunctionPass before running the
   // preceding module verifier.  AsmPrinter's base initialization consumes
   // module asm, so recheck the direct-call module envelope before delegating
-  // and before any untrusted module-level payload reaches MC.
-  if (DirectCall)
-    verifyBraceS3LateModuleEnvelope(M, DirectCallHome
-                                           ? BraceSdagDirectCallHomeABIName
-                                           : BraceSdagDirectCallABIName);
+  // and before any untrusted module-level payload reaches MC.  S3b.7c is
+  // instead closed by its independent final-publication pass after
+  // brace-finalize-branches: the byte-frame AsmPrinter must not consult IR
+  // when it mechanically projects that pass's verified final MIR.
+  if (DirectCall && !DirectCallByteFrame)
+    verifyBraceS3LateModuleEnvelope(
+        M, DirectCallHome ? BraceSdagDirectCallHomeABIName
+                          : BraceSdagDirectCallABIName);
   return AsmPrinter::doInitialization(M);
 }
 
@@ -152,6 +158,18 @@ void BraceAsmPrinter::emitS2(const MachineInstr &MI) {
   case Brace::HOME_RESTORE8:
   case Brace::HOME_RESTORE32:
     emitMC(Brace::S2_INTEGER_AND, {Reg(0), 6 + Imm(1), 6 + Imm(1)});
+    return;
+  case Brace::FRAME_ENTER:
+    emitMC(Brace::S2_FRAME_ENTER, {});
+    return;
+  case Brace::FRAME_LOAD32:
+    emitMC(Brace::S2_FRAME_LOAD, {Reg(0), Imm(1), Brace::U32});
+    return;
+  case Brace::FRAME_STORE32:
+    emitMC(Brace::S2_FRAME_STORE, {Imm(0), Reg(1), Brace::U32});
+    return;
+  case Brace::FRAME_LEAVE:
+    emitMC(Brace::S2_FRAME_LEAVE, {});
     return;
   case Brace::LOAD8:
     emitMC(Brace::S2_PHYSICAL_LOAD, {Reg(0), Brace::U8, Reg(1)});
@@ -267,10 +285,19 @@ bool BraceAsmPrinter::collectRegisterTypes(const MachineFunction &MF,
 }
 
 bool BraceAsmPrinter::runOnMachineFunction(MachineFunction &Function) {
+  if (DirectCallByteFrame &&
+      !Function.getInfo<BraceMachineFunctionInfo>()
+           ->isFinalByteFramePublicationVerified())
+    report_fatal_error(
+        "brace64 S3b.7c byte-frame AsmPrinter: independent "
+        "final-publication verification did not run");
   SetupMachineFunction(Function);
-  if (DirectCall)
+  // The byte-frame final-publication pass has already checked retained IR
+  // intent against final FRAME MIR.  Keep AsmPrinter out of that authority;
+  // the emission path below reads only the verified final MachineInstrs.
+  if (DirectCall && !DirectCallByteFrame)
     verifyBraceS3FinalMachineFunctionEnvelope(
-        Function, AllowsHomes, DirectCall,
+        Function, AllowsHomes, DirectCall, /*ByteFrame=*/false,
         DirectCallHome ? BraceSdagDirectCallHomeABIName
                        : BraceSdagDirectCallABIName);
   BlockStarts.clear();
@@ -303,10 +330,16 @@ bool BraceAsmPrinter::runOnMachineFunction(MachineFunction &Function) {
     uint32_t ResultKind = 0;
     SmallVector<uint8_t, 1> Parameters;
     SmallVector<uint32_t, 4> FunctionBlockStarts;
+    uint32_t FrameSizeBytes = 0;
     for (const MachineBasicBlock &MBB : Function)
       FunctionBlockStarts.push_back(blockStart(&MBB));
     if (Function.getName() == "brace_system_entry") {
       FunctionIndex = 0;
+      if (DirectCallByteFrame)
+        for (const MachineBasicBlock &MBB : Function)
+          for (const MachineInstr &MI : MBB)
+            if (MI.getOpcode() == Brace::FRAME_ENTER)
+              FrameSizeBytes = static_cast<uint32_t>(MI.getOperand(0).getImm());
     } else if (Function.getName() == "brace_system_call_leaf") {
       FunctionIndex = 1;
       ResultKind = 2;
@@ -319,7 +352,8 @@ bool BraceAsmPrinter::runOnMachineFunction(MachineFunction &Function) {
     consumeError(std::move(HeaderError));
     HeaderError = TargetStreamer->beginDirectFunction(
         FunctionIndex, RegisterTypes, blockStart(&Function.front()), ResultKind,
-        Parameters, FunctionBlockStarts, Brace::S2RelocationBase);
+        FrameSizeBytes, Parameters, FunctionBlockStarts,
+        Brace::S2RelocationBase);
   } else {
     consumeError(std::move(HeaderError));
     HeaderError = TargetStreamer->setHeader(

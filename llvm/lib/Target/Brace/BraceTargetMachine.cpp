@@ -10,6 +10,7 @@
 #include "Brace.h"
 #include "MCTargetDesc/BraceMCTargetDesc.h"
 #include "TargetInfo/BraceTargetInfo.h"
+#include "llvm/ADT/StringSwitch.h"
 #include "llvm/CodeGen/CodeGenTargetMachineImpl.h"
 #include "llvm/CodeGen/MachineModuleInfo.h"
 #include "llvm/CodeGen/Passes.h"
@@ -28,11 +29,30 @@
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/Compiler.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/ErrorHandling.h"
 
 using namespace llvm;
 
 namespace {
+
+StringRef getCodeGenPassLimitOption(StringRef OptionName) {
+  auto &Options = cl::getRegisteredOptions();
+  const auto Found = Options.find(OptionName);
+  if (Found == Options.end())
+    report_fatal_error("brace64 S3b.7c byte-frame selector: missing " +
+                       OptionName + " option");
+  return static_cast<cl::opt<std::string> *>(Found->second)->getValue();
+}
+
+bool isRegisteredByteFrameRestartSeam(StringRef PassName) {
+  return StringSwitch<bool>(PassName)
+      .Cases({"finalize-isel", "virtregrewriter"}, true)
+      .Cases({"stack-slot-coloring", "brace-finalize-byte-frame"}, true)
+      .Case("brace-finalize-branches", true)
+      .Default(false);
+}
 
 class BracePassConfig final : public TargetPassConfig {
 public:
@@ -72,17 +92,31 @@ public:
       addPass(createMachineVerifierPass(
           "After Brace S3b.4 spill-home finalization"));
       addPass(createBraceVerifyPostHomeFramePass());
+    } else if (getBraceTargetMachine().usesSdagDirectCallByteFrameABI()) {
+      addPass(createBraceByteFrameMachineVerifierPass(
+          "Before Brace S3b.7c byte-frame finalization"));
+      addPass(createBraceFinalizeByteFramePass());
+      addPass(createBraceByteFrameMachineVerifierPass(
+          "After Brace S3b.7c byte-frame finalization"));
+      addPass(createBraceVerifyPostByteFramePass());
     }
   }
 
   void addPreEmitPass2() override {
     const bool Homes = getBraceTargetMachine().usesSdagSpillHomes();
-    addPass(createMachineVerifierPass(Homes
-                                          ? "Before Brace S3b.4 publication"
+    const bool ByteFrame =
+        getBraceTargetMachine().usesSdagDirectCallByteFrameABI();
+    addPass(
+        createMachineVerifierPass(ByteFrame ? "Before Brace S3b.7c publication"
+                                  : Homes ? "Before Brace S3b.4 publication"
                                           : "Before Brace S3b.3 publication"));
     addPass(createBraceFinalizeBranchesPass(getBraceTargetMachine()));
-    addPass(createMachineVerifierPass(Homes ? "After Brace S3b.4 publication"
+    addPass(
+        createMachineVerifierPass(ByteFrame ? "After Brace S3b.7c publication"
+                                  : Homes   ? "After Brace S3b.4 publication"
                                             : "After Brace S3b.3 publication"));
+    if (ByteFrame)
+      addPass(createBraceVerifyFinalByteFramePublicationPass());
   }
 };
 
@@ -108,22 +142,33 @@ BraceTargetMachine::BraceTargetMachine(const Target &T, const Triple &TT,
     SdagABI = SdagABIKind::DirectCall;
   else if (ABI == BraceSdagDirectCallHomeABIName)
     SdagABI = SdagABIKind::DirectCallHome;
+  else if (ABI == BraceSdagDirectCallByteFrameABIName)
+    SdagABI = SdagABIKind::DirectCallByteFrame;
   UnsupportedConfiguration =
       (RM && *RM != Reloc::Static) ||
       ((SdagABI == SdagABIKind::DirectCall ||
-        SdagABI == SdagABIKind::DirectCallHome) &&
+        SdagABI == SdagABIKind::DirectCallHome ||
+        SdagABI == SdagABIKind::DirectCallByteFrame) &&
        CM.has_value()) ||
       (CM && *CM != CodeModel::Small) || JIT || OL != CodeGenOptLevel::Less ||
       (!CPU.empty() && CPU != "generic") || !FS.empty() ||
       (!ABI.empty() && ABI != BraceSdagLeafABIName &&
        ABI != BraceSdagLeafHomeABIName && ABI != BraceSdagDirectCallABIName &&
-       ABI != BraceSdagDirectCallHomeABIName);
+       ABI != BraceSdagDirectCallHomeABIName &&
+       ABI != BraceSdagDirectCallByteFrameABIName);
   initAsmInfo();
   setFastISel(false);
   setO0WantsFastISel(false);
 }
 
 BraceTargetMachine::~BraceTargetMachine() = default;
+
+MachineFunctionInfo *BraceTargetMachine::createMachineFunctionInfo(
+    BumpPtrAllocator &Allocator, const Function &F,
+    const TargetSubtargetInfo *STI) const {
+  return MachineFunctionInfo::create<BraceMachineFunctionInfo>(Allocator, F,
+                                                                STI);
+}
 
 StringRef BraceTargetMachine::getSdagABIName() const {
   switch (SdagABI) {
@@ -137,6 +182,8 @@ StringRef BraceTargetMachine::getSdagABIName() const {
     return BraceSdagDirectCallABIName;
   case SdagABIKind::DirectCallHome:
     return BraceSdagDirectCallHomeABIName;
+  case SdagABIKind::DirectCallByteFrame:
+    return BraceSdagDirectCallByteFrameABIName;
   }
   llvm_unreachable("unknown Brace SelectionDAG ABI");
 }
@@ -151,6 +198,20 @@ bool BraceTargetMachine::addPassesToEmitFile(
     MachineModuleInfoWrapperPass *MMIWP) {
   if (DwoOut || DisableVerify || UnsupportedConfiguration)
     return true;
+  if (usesSdagDirectCallByteFrameABI()) {
+    const StringRef StartBefore =
+        getCodeGenPassLimitOption("start-before");
+    if (!StartBefore.empty())
+      report_fatal_error(
+          "brace64 S3b.7c byte-frame selector: -start-before=" +
+          StartBefore + " is not an admitted restart boundary");
+    const StringRef StartAfter = getCodeGenPassLimitOption("start-after");
+    if (!StartAfter.empty() &&
+        !isRegisteredByteFrameRestartSeam(StartAfter))
+      report_fatal_error(
+          "brace64 S3b.7c byte-frame selector: -start-after=" + StartAfter +
+          " is not one of the five registered restart seams");
+  }
   if (usesSdagABI()) {
     if (FileType != CodeGenFileType::ObjectFile)
       return true;
@@ -186,6 +247,8 @@ BraceTargetMachine::createMCStreamer(raw_pwrite_stream &Out,
     Mode = Brace::S2ObjectMode::DirectCall;
   else if (usesSdagDirectCallHomeABI())
     Mode = Brace::S2ObjectMode::DirectCallHome;
+  else if (usesSdagDirectCallByteFrameABI())
+    Mode = Brace::S2ObjectMode::DirectCallByteFrame;
   std::unique_ptr<MCObjectWriter> Writer =
       Brace::createS2ObjectWriter(Out, Mode);
   MCStreamer *Streamer = getTarget().createMCObjectStreamer(
@@ -202,5 +265,8 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeBraceTarget() {
   initializeBraceDAGToDAGISelLegacyPass(PR);
   initializeBraceFinalizeSpillHomesLegacyPass(PR);
   initializeBraceVerifyPostHomeFrameLegacyPass(PR);
+  initializeBraceFinalizeByteFrameLegacyPass(PR);
+  initializeBraceVerifyPostByteFrameLegacyPass(PR);
   initializeBraceFinalizeBranchesLegacyPass(PR);
+  initializeBraceVerifyFinalByteFramePublicationLegacyPass(PR);
 }
