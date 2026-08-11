@@ -30,6 +30,7 @@ class BraceAsmPrinter final : public AsmPrinter {
   bool DirectCall;
   bool DirectCallHome;
   bool DirectCallByteFrame;
+  bool DirectCallFixedLocal;
 
 public:
   static char ID;
@@ -41,7 +42,9 @@ public:
         DirectCallHome(
             static_cast<BraceTargetMachine &>(TM).usesSdagDirectCallHomeABI()),
         DirectCallByteFrame(static_cast<BraceTargetMachine &>(TM)
-                                .usesSdagDirectCallByteFrameABI()) {}
+                                .usesSdagDirectCallByteFrameABI()),
+        DirectCallFixedLocal(static_cast<BraceTargetMachine &>(TM)
+                                 .usesSdagDirectCallByteFrameFixedLocalABI()) {}
 
   StringRef getPassName() const override {
     return "Brace S3b.3 S2 Assembly Printer";
@@ -74,7 +77,7 @@ bool BraceAsmPrinter::doInitialization(Module &M) {
   // instead closed by its independent final-publication pass after
   // brace-finalize-branches: the byte-frame AsmPrinter must not consult IR
   // when it mechanically projects that pass's verified final MIR.
-  if (DirectCall && !DirectCallByteFrame)
+  if (DirectCall && !DirectCallByteFrame && !DirectCallFixedLocal)
     verifyBraceS3LateModuleEnvelope(
         M, DirectCallHome ? BraceSdagDirectCallHomeABIName
                           : BraceSdagDirectCallABIName);
@@ -291,11 +294,15 @@ bool BraceAsmPrinter::runOnMachineFunction(MachineFunction &Function) {
     report_fatal_error(
         "brace64 S3b.7c byte-frame AsmPrinter: independent "
         "final-publication verification did not run");
+  if (DirectCallFixedLocal && !Function.getInfo<BraceMachineFunctionInfo>()
+                                   ->isFinalFixedLocalPublicationVerified())
+    report_fatal_error("brace64 S3b.8 fixed-local AsmPrinter: independent "
+                       "final-publication verification did not run");
   SetupMachineFunction(Function);
   // The byte-frame final-publication pass has already checked retained IR
   // intent against final FRAME MIR.  Keep AsmPrinter out of that authority;
   // the emission path below reads only the verified final MachineInstrs.
-  if (DirectCall && !DirectCallByteFrame)
+  if (DirectCall && !DirectCallByteFrame && !DirectCallFixedLocal)
     verifyBraceS3FinalMachineFunctionEnvelope(
         Function, AllowsHomes, DirectCall, /*ByteFrame=*/false,
         DirectCallHome ? BraceSdagDirectCallHomeABIName
@@ -335,7 +342,7 @@ bool BraceAsmPrinter::runOnMachineFunction(MachineFunction &Function) {
       FunctionBlockStarts.push_back(blockStart(&MBB));
     if (Function.getName() == "brace_system_entry") {
       FunctionIndex = 0;
-      if (DirectCallByteFrame)
+      if (DirectCallByteFrame || DirectCallFixedLocal)
         for (const MachineBasicBlock &MBB : Function)
           for (const MachineInstr &MI : MBB)
             if (MI.getOpcode() == Brace::FRAME_ENTER)

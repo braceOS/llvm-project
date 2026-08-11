@@ -123,6 +123,19 @@ let isPseudo = 1, mayStore = 1, hasSideEffects = 0 in {
                 "spill_store32 $src, $slot">;
 }
 
+// S3b.8 compiler-local carriers.  These retain the ordinary AS0 alloca's
+// FrameIndex and IR-backed volatile MMO only until the independent fixed-local
+// finalizer projects the effect to Guest byte-frame operations.
+let isPseudo = 1, mayStore = 1, hasSideEffects = 1 in {
+  def LOCAL_STORE32 : BraceMI<(outs), (ins I32Regs:$src, BraceFrameIndex:$slot),
+                              "local_store32 $src, $slot">;
+}
+
+let isPseudo = 1, mayLoad = 1, hasSideEffects = 1 in {
+  def LOCAL_LOAD32 : BraceMI<(outs I32Regs:$dst), (ins BraceFrameIndex:$slot),
+                             "local_load32 $dst, $slot">;
+}
+
 let isPseudo = 1, mayLoad = 1, hasSideEffects = 0 in {
   def SPILL_LOAD8
       : BraceMI<(outs I8Regs:$dst), (ins BraceFrameIndex:$slot),

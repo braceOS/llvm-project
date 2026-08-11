@@ -16,18 +16,39 @@ bool usesFinalizedSpillStorage(const MachineFunction &MF) {
   const StringRef ABI = MF.getTarget().Options.MCOptions.getABIName();
   return ABI == BraceSdagLeafHomeABIName ||
          ABI == BraceSdagDirectCallHomeABIName ||
-         ABI == BraceSdagDirectCallByteFrameABIName;
+         ABI == BraceSdagDirectCallByteFrameABIName ||
+         ABI == BraceSdagDirectCallByteFrameFixedLocalABIName;
 }
 
-bool hasOnlyDeadSpillObjects(const MachineFrameInfo &Frame) {
+bool usesFixedLocalStorage(const MachineFunction &MF) {
+  return MF.getTarget().Options.MCOptions.getABIName() ==
+         BraceSdagDirectCallByteFrameFixedLocalABIName;
+}
+
+bool hasOnlyDeadFrameObjects(const MachineFrameInfo &Frame,
+                             bool RequireSpillObjects,
+                             bool RequireDefaultStackID) {
   if (Frame.getNumFixedObjects() != 0)
     return false;
   for (int FI = Frame.getObjectIndexBegin(); FI != Frame.getObjectIndexEnd();
        ++FI)
-    if (!Frame.isDeadObjectIndex(FI) || !Frame.isSpillSlotObjectIndex(FI) ||
-        Frame.getObjectAllocation(FI) || Frame.isAliasedObjectIndex(FI))
+    if (!Frame.isDeadObjectIndex(FI) ||
+        (RequireSpillObjects && !Frame.isSpillSlotObjectIndex(FI)) ||
+        Frame.getObjectAllocation(FI) || Frame.isAliasedObjectIndex(FI) ||
+        (RequireDefaultStackID &&
+         Frame.getStackID(FI) != TargetStackID::Default))
       return false;
   return true;
+}
+
+bool hasOnlyDeadSpillObjects(const MachineFrameInfo &Frame) {
+  return hasOnlyDeadFrameObjects(Frame, /*RequireSpillObjects=*/true,
+                                 /*RequireDefaultStackID=*/false);
+}
+
+bool hasOnlyDeadFixedLocalObjects(const MachineFrameInfo &Frame) {
+  return hasOnlyDeadFrameObjects(Frame, /*RequireSpillObjects=*/false,
+                                 /*RequireDefaultStackID=*/true);
 }
 
 } // namespace
@@ -36,7 +57,10 @@ void BraceFrameLowering::emitPrologue(MachineFunction &MF,
                                       MachineBasicBlock &) const {
   const MachineFrameInfo &Frame = MF.getFrameInfo();
   if (usesFinalizedSpillStorage(MF)) {
-    if (Frame.getStackSize() != 0 || !hasOnlyDeadSpillObjects(Frame))
+    const bool ExactDeadObjects = usesFixedLocalStorage(MF)
+                                      ? hasOnlyDeadFixedLocalObjects(Frame)
+                                      : hasOnlyDeadSpillObjects(Frame);
+    if (Frame.getStackSize() != 0 || !ExactDeadObjects)
       report_fatal_error(
           "brace64 finalized spill transport requires zero LLVM frame storage");
     return;

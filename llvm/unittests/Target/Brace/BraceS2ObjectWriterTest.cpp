@@ -335,4 +335,198 @@ TEST(BraceS2ObjectWriterTest, DirectCallByteFrameOperationLimitIsExact) {
                         "direct-call function operation range is invalid");
 }
 
+std::array<S2DirectFunction, 2> canonicalFixedLocalFL1() {
+  auto Functions = canonicalByteFrameBF1();
+  Functions[0].Instructions[3] = inst(S2_FRAME_STORE, {8, 4, U32});
+  Functions[0].Instructions[5] = inst(S2_FRAME_LOAD, {5, 8, U32});
+  Functions[0].Instructions[6] = inst(S2_INTEGER_AND, {5, 5, 4});
+  Functions[0].Instructions[8] = inst(S2_PHYSICAL_STORE, {U32, 0, 5});
+  return Functions;
+}
+
+std::array<S2DirectFunction, 2> canonicalFixedLocalFL0() {
+  return canonicalByteFrameBF0();
+}
+
+Error writeFixedLocal(
+    std::array<S2DirectFunction, 2> &Functions, SmallVectorImpl<char> &Bytes,
+    S2ObjectMode Mode = S2ObjectMode::DirectCallByteFrameFixedLocal) {
+  raw_svector_ostream Out(Bytes);
+  S2ObjectWriter Writer(Out, Mode);
+  return Writer.writeDirectCallFixedLocalExact(Functions, /*EntryFunction=*/0,
+                                               S2RelocationBase);
+}
+
+void expectFixedLocalReject(
+    std::array<S2DirectFunction, 2> Functions, StringRef Diagnostic,
+    S2ObjectMode Mode = S2ObjectMode::DirectCallByteFrameFixedLocal) {
+  SmallVector<char, 2048> Bytes;
+  Error E = writeFixedLocal(Functions, Bytes, Mode);
+  ASSERT_TRUE(static_cast<bool>(E));
+  std::string Message = toString(std::move(E));
+  EXPECT_NE(Message.find(Diagnostic), std::string::npos) << Message;
+  EXPECT_TRUE(Bytes.empty());
+}
+
+TEST(BraceS2ObjectWriterTest,
+     AcceptsCanonicalDirectCallByteFrameFixedLocalFL1) {
+  auto Functions = canonicalFixedLocalFL1();
+  SmallVector<char, 2048> Bytes;
+  EXPECT_FALSE(static_cast<bool>(writeFixedLocal(Functions, Bytes)));
+  ASSERT_EQ(Bytes.size(), 1320u);
+  EXPECT_EQ(loadU32(Bytes, 48), UINT32_C(0x42520400));
+  EXPECT_EQ(loadU32(Bytes, 108), 16u);
+  EXPECT_EQ(loadU32(Bytes, 172), 0u);
+  const std::array<uint32_t, 16> Words = {
+      UINT32_C(0x00000267), UINT32_C(0x0000025b), UINT32_C(0x0000925f),
+      UINT32_C(0x0008266f), UINT32_C(0x00000243), UINT32_C(0x0008966b),
+      UINT32_C(0x04299613), UINT32_C(0x0000825b), UINT32_C(0x00050663),
+      UINT32_C(0x00000273), UINT32_C(0x00000253), UINT32_C(0x0001025b),
+      UINT32_C(0x0000965f), UINT32_C(0x04299613), UINT32_C(0x05299213),
+      UINT32_C(0x00009253)};
+  for (unsigned Index = 0; Index != Words.size(); ++Index)
+    EXPECT_EQ(loadU32(Bytes, 0x120 + 4 * Index), Words[Index]);
+}
+
+TEST(BraceS2ObjectWriterTest,
+     AcceptsCanonicalDirectCallByteFrameFixedLocalFL0AndMatchesOldMode) {
+  auto FixedFunctions = canonicalFixedLocalFL0();
+  auto OldFunctions = canonicalByteFrameBF0();
+  SmallVector<char, 2048> FixedBytes;
+  SmallVector<char, 2048> OldBytes;
+  EXPECT_FALSE(static_cast<bool>(writeFixedLocal(FixedFunctions, FixedBytes)));
+  EXPECT_FALSE(static_cast<bool>(writeByteFrame(OldFunctions, OldBytes)));
+  ASSERT_EQ(FixedBytes.size(), 1304u);
+  EXPECT_TRUE(ArrayRef<char>(FixedBytes) == ArrayRef<char>(OldBytes));
+  EXPECT_EQ(loadU32(FixedBytes, 48), UINT32_C(0x42520400));
+  EXPECT_EQ(loadU32(FixedBytes, 108), 0u);
+  EXPECT_EQ(loadU32(FixedBytes, 172), 0u);
+}
+
+TEST(BraceS2ObjectWriterTest,
+     RejectsDirectCallByteFrameFixedLocalOffsetAndLifecycleForgeries) {
+  auto WrongStoreOffset = canonicalFixedLocalFL1();
+  WrongStoreOffset[0].Instructions[3] = inst(S2_FRAME_STORE, {4, 4, U32});
+  expectFixedLocalReject(std::move(WrongStoreOffset),
+                         "S3b.8 FrameStore32 operands are not exact");
+
+  auto WrongLoadOffset = canonicalFixedLocalFL1();
+  WrongLoadOffset[0].Instructions[5] = inst(S2_FRAME_LOAD, {5, 4, U32});
+  expectFixedLocalReject(std::move(WrongLoadOffset),
+                         "S3b.8 FrameLoad32 operands are not exact");
+
+  auto WrongWidth = canonicalFixedLocalFL1();
+  WrongWidth[0].Instructions[5] = inst(S2_FRAME_LOAD, {5, 8, U8});
+  expectFixedLocalReject(std::move(WrongWidth),
+                         "S3b.8 FrameLoad32 operands are not exact");
+
+  auto WrongFrameSize = canonicalFixedLocalFL1();
+  WrongFrameSize[0].FrameSizeBytes = 32;
+  expectFixedLocalReject(std::move(WrongFrameSize),
+                         "requires FL0 or root frame 16");
+
+  auto SplitCall = canonicalFixedLocalFL1();
+  SplitCall[0].BlockStarts.push_back(4);
+  expectFixedLocalReject(std::move(SplitCall),
+                         "root or helper operation shape is not exact");
+}
+
+TEST(BraceS2ObjectWriterTest,
+     RejectsDirectCallByteFrameFixedLocalDescriptorAndFlowForgeries) {
+  auto WrongTarget = canonicalFixedLocalFL1();
+  WrongTarget[0].Instructions[4] = inst(S2_DIRECT_CALL, {0, 4, 4});
+  expectFixedLocalReject(std::move(WrongTarget),
+                         "descriptor is not exact leaf1/r4/r4");
+
+  auto WrongResult = canonicalFixedLocalFL1();
+  WrongResult[0].Instructions[4] = inst(S2_DIRECT_CALL, {1, 5, 4});
+  expectFixedLocalReject(std::move(WrongResult),
+                         "descriptor is not exact leaf1/r4/r4");
+
+  auto WrongArgument = canonicalFixedLocalFL1();
+  WrongArgument[0].Instructions[4] = inst(S2_DIRECT_CALL, {1, 4, 5});
+  expectFixedLocalReject(std::move(WrongArgument),
+                         "descriptor is not exact leaf1/r4/r4");
+
+  auto SaveDiffersFromCallArgument = canonicalFixedLocalFL1();
+  SaveDiffersFromCallArgument[0].Instructions[3] =
+      inst(S2_FRAME_STORE, {8, 5, U32});
+  expectFixedLocalReject(std::move(SaveDiffersFromCallArgument),
+                         "FrameStore source and Call argument differ");
+
+  auto OnlyCallResult = canonicalFixedLocalFL1();
+  OnlyCallResult[0].Instructions[6] = inst(S2_INTEGER_AND, {5, 4, 4});
+  expectFixedLocalReject(std::move(OnlyCallResult),
+                         "Call result and FrameLoad do not jointly reach");
+
+  auto OnlyFrameLoad = canonicalFixedLocalFL1();
+  OnlyFrameLoad[0].Instructions[6] = inst(S2_INTEGER_AND, {5, 5, 5});
+  expectFixedLocalReject(std::move(OnlyFrameLoad),
+                         "Call result and FrameLoad do not jointly reach");
+}
+
+TEST(BraceS2ObjectWriterTest,
+     DirectCallByteFrameFixedLocalWriterModesAreIsolated) {
+  auto FixedForOldMethod = canonicalFixedLocalFL1();
+  SmallVector<char, 2048> FixedForOldBytes;
+  Error OldMethodNewMode =
+      writeMode(FixedForOldMethod, FixedForOldBytes,
+                S2ObjectMode::DirectCallByteFrameFixedLocal);
+  ASSERT_TRUE(static_cast<bool>(OldMethodNewMode));
+  EXPECT_NE(toString(std::move(OldMethodNewMode))
+                .find("direct-call write used with the legacy writer mode"),
+            std::string::npos);
+  EXPECT_TRUE(FixedForOldBytes.empty());
+
+  auto FixedForOldMode = canonicalFixedLocalFL1();
+  expectFixedLocalReject(std::move(FixedForOldMode),
+                         "fixed-local write used outside its exact writer "
+                         "mode",
+                         S2ObjectMode::DirectCallByteFrame);
+
+  auto OldBF1InNewMode = canonicalByteFrameBF1();
+  expectFixedLocalReject(std::move(OldBF1InNewMode),
+                         "S3b.8 FrameStore32 operands are not exact");
+
+  auto FixedFL1InOldMode = canonicalFixedLocalFL1();
+  SmallVector<char, 2048> OldModeBytes;
+  Error E = writeByteFrame(FixedFL1InOldMode, OldModeBytes);
+  ASSERT_TRUE(static_cast<bool>(E));
+  EXPECT_NE(toString(std::move(E)).find("FrameStore32 operands are not exact"),
+            std::string::npos);
+  EXPECT_TRUE(OldModeBytes.empty());
+}
+
+TEST(BraceS2ObjectWriterTest,
+     DirectCallByteFrameFixedLocalShapeAndCountsAreExact) {
+  auto ExtraRootOperation = canonicalFixedLocalFL1();
+  ExtraRootOperation[0].Instructions.insert(
+      ExtraRootOperation[0].Instructions.begin() + 1,
+      inst(S2_CONSTANT, {5, I32, 0}));
+  expectFixedLocalReject(std::move(ExtraRootOperation),
+                         "root or helper operation shape is not exact");
+
+  auto ExtraHelperOperation = canonicalFixedLocalFL1();
+  ExtraHelperOperation[1].Instructions.insert(
+      ExtraHelperOperation[1].Instructions.end() - 1,
+      inst(S2_INTEGER_AND, {5, 5, 4}));
+  expectFixedLocalReject(std::move(ExtraHelperOperation),
+                         "root or helper operation shape is not exact");
+
+  auto FL0WithFrameDeclaration = canonicalFixedLocalFL0();
+  FL0WithFrameDeclaration[0].FrameSizeBytes = 16;
+  expectFixedLocalReject(std::move(FL0WithFrameDeclaration),
+                         "root or helper operation shape is not exact");
+
+  auto FL1WithoutFrameDeclaration = canonicalFixedLocalFL1();
+  FL1WithoutFrameDeclaration[0].FrameSizeBytes = 0;
+  expectFixedLocalReject(std::move(FL1WithoutFrameDeclaration),
+                         "root or helper operation shape is not exact");
+
+  auto MissingHelper = canonicalFixedLocalFL1();
+  MissingHelper[1].Present = false;
+  expectFixedLocalReject(std::move(MissingHelper),
+                         "requires entry function 0 and leaf 1");
+}
+
 } // namespace

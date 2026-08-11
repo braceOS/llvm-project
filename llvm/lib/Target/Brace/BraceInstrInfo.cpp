@@ -32,7 +32,8 @@ bool allowsPAddrRematerialization(const MachineFunction &MF) {
   const StringRef ABI = MF.getTarget().Options.MCOptions.getABIName();
   return ABI == BraceSdagLeafHomeABIName || ABI == BraceSdagDirectCallABIName ||
          ABI == BraceSdagDirectCallHomeABIName ||
-         ABI == BraceSdagDirectCallByteFrameABIName;
+         ABI == BraceSdagDirectCallByteFrameABIName ||
+         ABI == BraceSdagDirectCallByteFrameFixedLocalABIName;
 }
 
 unsigned spillStoreOpcode(const TargetRegisterClass *RC) {

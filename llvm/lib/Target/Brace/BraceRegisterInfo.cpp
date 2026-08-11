@@ -46,6 +46,10 @@ bool BraceRegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator MI, int,
                 BraceSdagDirectCallByteFrameABIName)
     report_fatal_error(
         "brace64 S3b.7c byte-frame index survived target finalization");
+  if (MF && MF->getTarget().Options.MCOptions.getABIName() ==
+                BraceSdagDirectCallByteFrameFixedLocalABIName)
+    report_fatal_error("brace64 S3b.8 fixed-local frame index survived target "
+                       "finalization");
   report_fatal_error(
       "brace64 S3b.3 leaf ABI does not admit stack frame indices");
 }

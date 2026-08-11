@@ -49,6 +49,7 @@ enum class S2ObjectMode : uint8_t {
   DirectCall,
   DirectCallHome,
   DirectCallByteFrame,
+  DirectCallByteFrameFixedLocal,
 };
 
 struct S2DirectFunction final {
@@ -74,6 +75,9 @@ public:
                    uint64_t RelocationBase);
   Error writeDirectCallExact(ArrayRef<S2DirectFunction> Functions,
                              uint32_t EntryFunction, uint64_t RelocationBase);
+  Error writeDirectCallFixedLocalExact(ArrayRef<S2DirectFunction> Functions,
+                                       uint32_t EntryFunction,
+                                       uint64_t RelocationBase);
 
   S2ObjectMode getMode() const { return Mode; }
 

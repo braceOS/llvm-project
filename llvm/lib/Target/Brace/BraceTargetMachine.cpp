@@ -54,6 +54,47 @@ bool isRegisteredByteFrameRestartSeam(StringRef PassName) {
       .Default(false);
 }
 
+struct FixedLocalPassLimitOption {
+  StringRef Value;
+  unsigned Occurrences;
+};
+
+FixedLocalPassLimitOption
+getFixedLocalCodeGenPassLimitOption(StringRef OptionName) {
+  auto &Options = cl::getRegisteredOptions();
+  const auto Found = Options.find(OptionName);
+  if (Found == Options.end())
+    report_fatal_error("brace64 S3b.8 fixed-local selector: missing " +
+                       OptionName + " option");
+  const auto *Option = static_cast<cl::opt<std::string> *>(Found->second);
+  return {Option->getValue(),
+          static_cast<unsigned>(Option->getNumOccurrences())};
+}
+
+bool isRegisteredFixedLocalRestartSeam(StringRef PassName) {
+  return StringSwitch<bool>(PassName)
+      .Cases({"finalize-isel", "virtregrewriter"}, true)
+      .Cases({"stack-slot-coloring", "brace-finalize-fixed-local-byte-frame"},
+             true)
+      .Case("brace-finalize-branches", true)
+      .Default(false);
+}
+
+bool isRegisteredFixedLocalAuditStop(StringRef PassName) {
+  return PassName == "brace-verify-final-fixed-local-publication";
+}
+
+bool isRegisteredFixedLocalPropagationPair(StringRef StartAfter,
+                                           StringRef StopAfter) {
+  return (StartAfter == "finalize-isel" && StopAfter == "virtregrewriter") ||
+         (StartAfter == "virtregrewriter" &&
+          StopAfter == "stack-slot-coloring") ||
+         (StartAfter == "stack-slot-coloring" &&
+          StopAfter == "brace-finalize-fixed-local-byte-frame") ||
+         (StartAfter == "brace-finalize-fixed-local-byte-frame" &&
+          StopAfter == "brace-finalize-branches");
+}
+
 class BracePassConfig final : public TargetPassConfig {
 public:
   BracePassConfig(BraceTargetMachine &TM, PassManagerBase &PM)
@@ -99,6 +140,14 @@ public:
       addPass(createBraceByteFrameMachineVerifierPass(
           "After Brace S3b.7c byte-frame finalization"));
       addPass(createBraceVerifyPostByteFramePass());
+    } else if (getBraceTargetMachine()
+                   .usesSdagDirectCallByteFrameFixedLocalABI()) {
+      addPass(createBraceFixedLocalMachineVerifierPass(
+          "Before Brace S3b.8 fixed-local byte-frame finalization"));
+      addPass(createBraceFinalizeFixedLocalPass());
+      addPass(createBraceFixedLocalMachineVerifierPass(
+          "After Brace S3b.8 fixed-local byte-frame finalization"));
+      addPass(createBraceVerifyPostFixedLocalPass());
     }
   }
 
@@ -106,17 +155,23 @@ public:
     const bool Homes = getBraceTargetMachine().usesSdagSpillHomes();
     const bool ByteFrame =
         getBraceTargetMachine().usesSdagDirectCallByteFrameABI();
-    addPass(
-        createMachineVerifierPass(ByteFrame ? "Before Brace S3b.7c publication"
-                                  : Homes ? "Before Brace S3b.4 publication"
-                                          : "Before Brace S3b.3 publication"));
+    const bool FixedLocal =
+        getBraceTargetMachine().usesSdagDirectCallByteFrameFixedLocalABI();
+    addPass(createMachineVerifierPass(
+        FixedLocal  ? "Before Brace S3b.8 publication"
+        : ByteFrame ? "Before Brace S3b.7c publication"
+        : Homes     ? "Before Brace S3b.4 publication"
+                    : "Before Brace S3b.3 publication"));
     addPass(createBraceFinalizeBranchesPass(getBraceTargetMachine()));
     addPass(
-        createMachineVerifierPass(ByteFrame ? "After Brace S3b.7c publication"
-                                  : Homes   ? "After Brace S3b.4 publication"
-                                            : "After Brace S3b.3 publication"));
+        createMachineVerifierPass(FixedLocal  ? "After Brace S3b.8 publication"
+                                  : ByteFrame ? "After Brace S3b.7c publication"
+                                  : Homes ? "After Brace S3b.4 publication"
+                                          : "After Brace S3b.3 publication"));
     if (ByteFrame)
       addPass(createBraceVerifyFinalByteFramePublicationPass());
+    else if (FixedLocal)
+      addPass(createBraceVerifyFinalFixedLocalPublicationPass());
   }
 };
 
@@ -144,18 +199,22 @@ BraceTargetMachine::BraceTargetMachine(const Target &T, const Triple &TT,
     SdagABI = SdagABIKind::DirectCallHome;
   else if (ABI == BraceSdagDirectCallByteFrameABIName)
     SdagABI = SdagABIKind::DirectCallByteFrame;
+  else if (ABI == BraceSdagDirectCallByteFrameFixedLocalABIName)
+    SdagABI = SdagABIKind::DirectCallByteFrameFixedLocal;
   UnsupportedConfiguration =
       (RM && *RM != Reloc::Static) ||
       ((SdagABI == SdagABIKind::DirectCall ||
         SdagABI == SdagABIKind::DirectCallHome ||
-        SdagABI == SdagABIKind::DirectCallByteFrame) &&
+        SdagABI == SdagABIKind::DirectCallByteFrame ||
+        SdagABI == SdagABIKind::DirectCallByteFrameFixedLocal) &&
        CM.has_value()) ||
       (CM && *CM != CodeModel::Small) || JIT || OL != CodeGenOptLevel::Less ||
       (!CPU.empty() && CPU != "generic") || !FS.empty() ||
       (!ABI.empty() && ABI != BraceSdagLeafABIName &&
        ABI != BraceSdagLeafHomeABIName && ABI != BraceSdagDirectCallABIName &&
        ABI != BraceSdagDirectCallHomeABIName &&
-       ABI != BraceSdagDirectCallByteFrameABIName);
+       ABI != BraceSdagDirectCallByteFrameABIName &&
+       ABI != BraceSdagDirectCallByteFrameFixedLocalABIName);
   initAsmInfo();
   setFastISel(false);
   setO0WantsFastISel(false);
@@ -184,6 +243,8 @@ StringRef BraceTargetMachine::getSdagABIName() const {
     return BraceSdagDirectCallHomeABIName;
   case SdagABIKind::DirectCallByteFrame:
     return BraceSdagDirectCallByteFrameABIName;
+  case SdagABIKind::DirectCallByteFrameFixedLocal:
+    return BraceSdagDirectCallByteFrameFixedLocalABIName;
   }
   llvm_unreachable("unknown Brace SelectionDAG ABI");
 }
@@ -211,6 +272,69 @@ bool BraceTargetMachine::addPassesToEmitFile(
       report_fatal_error(
           "brace64 S3b.7c byte-frame selector: -start-after=" + StartAfter +
           " is not one of the five registered restart seams");
+  }
+  if (usesSdagDirectCallByteFrameFixedLocalABI()) {
+    const FixedLocalPassLimitOption StartBefore =
+        getFixedLocalCodeGenPassLimitOption("start-before");
+    const FixedLocalPassLimitOption StartAfter =
+        getFixedLocalCodeGenPassLimitOption("start-after");
+    const FixedLocalPassLimitOption StopBefore =
+        getFixedLocalCodeGenPassLimitOption("stop-before");
+    const FixedLocalPassLimitOption StopAfter =
+        getFixedLocalCodeGenPassLimitOption("stop-after");
+    if (StartBefore.Occurrences > 1)
+      report_fatal_error(
+          "brace64 S3b.8 fixed-local selector: -start-before is specified "
+          "more than once");
+    if (StartAfter.Occurrences > 1)
+      report_fatal_error(
+          "brace64 S3b.8 fixed-local selector: -start-after is specified "
+          "more than once");
+    if (StopBefore.Occurrences > 1)
+      report_fatal_error(
+          "brace64 S3b.8 fixed-local selector: -stop-before is specified "
+          "more than once");
+    if (StopAfter.Occurrences > 1)
+      report_fatal_error(
+          "brace64 S3b.8 fixed-local selector: -stop-after is specified more "
+          "than once");
+    if ((StartBefore.Occurrences != 0 || StartAfter.Occurrences != 0) &&
+        (StopBefore.Occurrences != 0 || StopAfter.Occurrences != 0) &&
+        !(StartBefore.Occurrences == 0 && StopBefore.Occurrences == 0 &&
+          StartAfter.Occurrences == 1 && StopAfter.Occurrences == 1 &&
+          isRegisteredFixedLocalPropagationPair(StartAfter.Value,
+                                                StopAfter.Value)))
+      report_fatal_error(
+          "brace64 S3b.8 fixed-local selector: start/stop pass-limit pair is "
+          "not one of the four registered forward propagation pairs");
+    if (StartBefore.Occurrences != 0)
+      report_fatal_error("brace64 S3b.8 fixed-local selector: -start-before=" +
+                         StartBefore.Value +
+                         " is not an admitted restart boundary");
+    if (StartAfter.Occurrences == 1 && StartAfter.Value.empty())
+      report_fatal_error(
+          "brace64 S3b.8 fixed-local selector: -start-after requires a "
+          "nonempty pass name");
+    if (StartAfter.Occurrences == 1 &&
+        !isRegisteredFixedLocalRestartSeam(StartAfter.Value))
+      report_fatal_error("brace64 S3b.8 fixed-local selector: -start-after=" +
+                         StartAfter.Value +
+                         " is not one of the five registered restart seams");
+    if (StopBefore.Occurrences != 0)
+      report_fatal_error("brace64 S3b.8 fixed-local selector: -stop-before=" +
+                         StopBefore.Value +
+                         " is not an admitted stop boundary");
+    if (StopAfter.Occurrences == 1 && StopAfter.Value.empty())
+      report_fatal_error(
+          "brace64 S3b.8 fixed-local selector: -stop-after requires a "
+          "nonempty pass name");
+    if (StopAfter.Occurrences == 1 &&
+        !isRegisteredFixedLocalRestartSeam(StopAfter.Value) &&
+        !isRegisteredFixedLocalAuditStop(StopAfter.Value))
+      report_fatal_error(
+          "brace64 S3b.8 fixed-local selector: -stop-after=" + StopAfter.Value +
+          " is neither one of the five registered restart seams nor the "
+          "audit-only final-publication stop");
   }
   if (usesSdagABI()) {
     if (FileType != CodeGenFileType::ObjectFile)
@@ -249,6 +373,8 @@ BraceTargetMachine::createMCStreamer(raw_pwrite_stream &Out,
     Mode = Brace::S2ObjectMode::DirectCallHome;
   else if (usesSdagDirectCallByteFrameABI())
     Mode = Brace::S2ObjectMode::DirectCallByteFrame;
+  else if (usesSdagDirectCallByteFrameFixedLocalABI())
+    Mode = Brace::S2ObjectMode::DirectCallByteFrameFixedLocal;
   std::unique_ptr<MCObjectWriter> Writer =
       Brace::createS2ObjectWriter(Out, Mode);
   MCStreamer *Streamer = getTarget().createMCObjectStreamer(
@@ -269,4 +395,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeBraceTarget() {
   initializeBraceVerifyPostByteFrameLegacyPass(PR);
   initializeBraceFinalizeBranchesLegacyPass(PR);
   initializeBraceVerifyFinalByteFramePublicationLegacyPass(PR);
+  initializeBraceFinalizeFixedLocalLegacyPass(PR);
+  initializeBraceVerifyPostFixedLocalLegacyPass(PR);
+  initializeBraceVerifyFinalFixedLocalPublicationLegacyPass(PR);
 }

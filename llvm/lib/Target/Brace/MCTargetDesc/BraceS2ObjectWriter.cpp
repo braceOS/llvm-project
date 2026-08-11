@@ -493,6 +493,9 @@ Error S2TargetStreamer::writeObject(S2ObjectWriter &Writer) const {
   if (HasHeader || DirectFunctions.size() != 2 || !DirectFunctions[0].Present ||
       !DirectFunctions[1].Present)
     return fail("direct writer requires exactly two direct functions");
+  if (Writer.getMode() == S2ObjectMode::DirectCallByteFrameFixedLocal)
+    return Writer.writeDirectCallFixedLocalExact(
+        DirectFunctions, /*EntryFunction=*/0, RelocationBase);
   return Writer.writeDirectCallExact(DirectFunctions, /*EntryFunction=*/0,
                                      RelocationBase);
 }
@@ -1654,6 +1657,1063 @@ Error S2ObjectWriter::writeDirectCallExact(ArrayRef<S2DirectFunction> Functions,
            DirectCallByteFrame ? DirectByteFrameExperimentalFlags
            : DirectCallHome    ? DirectHomeExperimentalFlags
                                : DirectExperimentalFlags);
+  storeU16(Bytes, 52, 64);
+  storeU16(Bytes, 58, 64);
+  storeU16(Bytes, 60, DirectSectionCount);
+  storeU16(Bytes, 62, 10);
+
+  storeU32(Bytes, L.TargetOffset, 0);
+  storeU32(Bytes, L.TargetOffset + 4, 0);
+  storeU32(Bytes, L.TargetOffset + 8, 1);
+  storeU32(Bytes, L.TargetOffset + 12, 0);
+  storeU32(Bytes, L.TargetOffset + 16, 0);
+  storeU32(Bytes, L.TargetOffset + 20, 1);
+  storeU32(Bytes, L.TargetOffset + 24, 0);
+  storeU32(Bytes, L.TargetOffset + 28, EntryFunction);
+
+  uint32_t RegisterFirst = 0;
+  uint32_t OperationFirst = 0;
+  uint32_t DescriptorFirst = 0;
+  uint64_t TypeCursor = L.TypesOffset;
+  uint64_t TextCursor = L.TextOffset;
+  uint64_t DescriptorCursor = L.DescriptorsOffset;
+  for (unsigned FunctionIndex = 0; FunctionIndex != Functions.size();
+       ++FunctionIndex) {
+    const S2DirectFunction &Function = Functions[FunctionIndex];
+    const uint64_t Record =
+        L.FunctionsOffset + FunctionIndex * DirectFunctionSize;
+    storeU32(Bytes, Record, Function.Entry);
+    storeU32(Bytes, Record + 4, Function.ResultKind);
+    storeU32(Bytes, Record + 8, Function.ParameterSlots.size());
+    storeU32(Bytes, Record + 12, Function.FrameSizeBytes);
+    for (unsigned Parameter = 0; Parameter != 4; ++Parameter)
+      storeU32(Bytes, Record + 16 + Parameter * 4,
+               Parameter < Function.ParameterSlots.size()
+                   ? Function.ParameterSlots[Parameter]
+                   : UINT32_MAX);
+    storeU32(Bytes, Record + 32, RegisterFirst);
+    storeU32(Bytes, Record + 36, Function.RegisterTypes.size());
+    storeU32(Bytes, Record + 40, OperationFirst);
+    storeU32(Bytes, Record + 44, Function.Instructions.size());
+    storeU32(Bytes, Record + 48, DescriptorFirst);
+    storeU32(Bytes, Record + 52, FunctionDescriptors[FunctionIndex].size());
+
+    llvm::copy(Function.RegisterTypes, Bytes.begin() + TypeCursor);
+    TypeCursor += Function.RegisterTypes.size();
+    for (const DirectDescriptor &Descriptor :
+         FunctionDescriptors[FunctionIndex]) {
+      llvm::copy(Descriptor, Bytes.begin() + DescriptorCursor);
+      DescriptorCursor += DirectDescriptorSize;
+    }
+    for (uint32_t Word : FunctionWords[FunctionIndex]) {
+      storeU32(Bytes, TextCursor, Word);
+      TextCursor += TextWordSize;
+    }
+
+    RegisterFirst += Function.RegisterTypes.size();
+    OperationFirst += Function.Instructions.size();
+    DescriptorFirst += FunctionDescriptors[FunctionIndex].size();
+  }
+
+  for (size_t I = 0; I != Literals.size(); ++I)
+    storeU64(Bytes, L.LiteralsOffset + I * LiteralSize,
+             Literals[I].IsPhysical ? 0 : Literals[I].Value);
+
+  size_t RelocationIndex = 0;
+  for (size_t I = 0; I != Literals.size(); ++I) {
+    if (!Literals[I].IsPhysical)
+      continue;
+    auto Addend = relocationAddend(RelocationBase, Literals[I].Value);
+    if (!Addend)
+      return Addend.takeError();
+    const uint64_t Base = L.RelaOffset + RelocationIndex * RelaSize;
+    storeU64(Bytes, Base, I * LiteralSize);
+    storeU64(Bytes, Base + 8, RelaInfo);
+    storeU64(Bytes, Base + 16, static_cast<uint64_t>(*Addend));
+    ++RelocationIndex;
+  }
+
+  storeU16(Bytes, L.SymtabOffset + SymbolSize + 6, AbsoluteSection);
+  storeU64(Bytes, L.SymtabOffset + SymbolSize + 8, RelocationBase);
+  std::copy(std::begin(DirectSectionNames), std::end(DirectSectionNames),
+            Bytes.begin() + L.ShstrtabOffset);
+
+  const uint64_t SH = L.SectionHeadersOffset;
+  storeSection(Bytes, SH + SectionHeaderSize, 1, 1, 0, L.TargetOffset,
+               TargetSize, 0, 0, 8, TargetSize);
+  storeSection(Bytes, SH + 2 * SectionHeaderSize, 15, 1, 0, L.FunctionsOffset,
+               Functions.size() * DirectFunctionSize, 0, 0, 8,
+               DirectFunctionSize);
+  storeSection(Bytes, SH + 3 * SectionHeaderSize, 32, 1, 0, L.TypesOffset,
+               RegisterCount, 0, 0, 1, 1);
+  storeSection(Bytes, SH + 4 * SectionHeaderSize, 45, 1, 0, L.LiteralsOffset,
+               Literals.size() * LiteralSize, 0, 0, 8, LiteralSize);
+  storeSection(Bytes, SH + 5 * SectionHeaderSize, 61, 1, 0, L.DescriptorsOffset,
+               DescriptorCount * DirectDescriptorSize, 0, 0, 8,
+               DirectDescriptorSize);
+  storeSection(Bytes, SH + 6 * SectionHeaderSize, 80, 1, 6, L.TextOffset,
+               OperationCount * TextWordSize, 0, 0, 4, TextWordSize);
+  storeSection(Bytes, SH + 7 * SectionHeaderSize, 92, 4, 0, L.RelaOffset,
+               RelocationCount * RelaSize, 8, 4, 8, RelaSize);
+  storeSection(Bytes, SH + 8 * SectionHeaderSize, 113, 2, 0, L.SymtabOffset,
+               SymbolCount * SymbolSize, 9, 2, 8, SymbolSize);
+  storeSection(Bytes, SH + 9 * SectionHeaderSize, 121, 3, 0, L.StrtabOffset, 1,
+               0, 0, 1, 0);
+  storeSection(Bytes, SH + 10 * SectionHeaderSize, 129, 3, 0, L.ShstrtabOffset,
+               sizeof(DirectSectionNames), 0, 0, 1, 0);
+
+  Out.write(reinterpret_cast<const char *>(Bytes.data()), Bytes.size());
+  Out.flush();
+  return Error::success();
+}
+
+Error S2ObjectWriter::writeDirectCallFixedLocalExact(
+    ArrayRef<S2DirectFunction> Functions, uint32_t EntryFunction,
+    uint64_t RelocationBase) {
+  if (Mode != S2ObjectMode::DirectCallByteFrameFixedLocal)
+    return fail("fixed-local write used outside its exact writer mode");
+  if (Functions.size() != 2 || EntryFunction != 0 || !Functions[0].Present ||
+      !Functions[1].Present)
+    return fail("direct-call writer requires entry function 0 and leaf 1");
+
+  constexpr std::array<uint8_t, 6> RequiredTypes{PADDR, PADDR, I8,
+                                                 I8,    I32,   I32};
+  constexpr std::array<uint8_t, 7> RequiredHomeTypes{PADDR, PADDR, I8, I8,
+                                                     I32,   I32,   I32};
+  const bool DirectCallHome = false;
+  const bool DirectCallFixedLocal = true;
+  const bool ExactTypes =
+      DirectCallHome
+          ? (Functions[0].RegisterTypes == ArrayRef<uint8_t>(RequiredTypes) ||
+             Functions[0].RegisterTypes ==
+                 ArrayRef<uint8_t>(RequiredHomeTypes)) &&
+                Functions[1].RegisterTypes == ArrayRef<uint8_t>(RequiredTypes)
+          : Functions[0].RegisterTypes == ArrayRef<uint8_t>(RequiredTypes) &&
+                Functions[1].RegisterTypes == ArrayRef<uint8_t>(RequiredTypes);
+  if (!ExactTypes || !Functions[0].ParameterSlots.empty() ||
+      Functions[0].ResultKind != 0 ||
+      Functions[1].ParameterSlots != ArrayRef<uint8_t>({4}) ||
+      Functions[1].ResultKind != 2)
+    return fail("direct-call functions do not have the exact S3b.5 signature");
+  if (DirectCallFixedLocal) {
+    if ((Functions[0].FrameSizeBytes != 0 &&
+         Functions[0].FrameSizeBytes != 16) ||
+        Functions[1].FrameSizeBytes != 0)
+      return fail("S3b.8 compiler profile requires FL0 or root frame 16");
+  } else if (Functions[0].FrameSizeBytes != 0 ||
+             Functions[1].FrameSizeBytes != 0) {
+    return fail("older direct-call identity carries a frame declaration");
+  }
+
+  constexpr std::array<unsigned, 6> FL0RootOpcodes{
+      S2_PHYSICAL_ADDRESS, S2_PHYSICAL_LOAD,  S2_DIRECT_CALL,
+      S2_PHYSICAL_ADDRESS, S2_PHYSICAL_STORE, S2_RETURN};
+  constexpr std::array<unsigned, 11> FL1RootOpcodes{
+      S2_FRAME_ENTER,    S2_PHYSICAL_ADDRESS,
+      S2_PHYSICAL_LOAD,  S2_FRAME_STORE,
+      S2_DIRECT_CALL,    S2_FRAME_LOAD,
+      S2_INTEGER_AND,    S2_PHYSICAL_ADDRESS,
+      S2_PHYSICAL_STORE, S2_FRAME_LEAVE,
+      S2_RETURN};
+  constexpr std::array<unsigned, 5> FLLeafOpcodes{
+      S2_PHYSICAL_ADDRESS, S2_PHYSICAL_LOAD, S2_INTEGER_AND, S2_INTEGER_AND,
+      S2_RETURN_VALUE};
+  auto HasExactOpcodes = [](const S2DirectFunction &Function, auto Expected) {
+    return Function.Instructions.size() == Expected.size() &&
+           llvm::equal(Function.Instructions, Expected,
+                       [](const MCInst &Inst, unsigned Opcode) {
+                         return Inst.getOpcode() == Opcode;
+                       });
+  };
+  const bool FL1 = Functions[0].FrameSizeBytes == 16;
+  if (Functions[0].BlockStarts != ArrayRef<uint32_t>({0}) ||
+      Functions[1].BlockStarts != ArrayRef<uint32_t>({0}) ||
+      Functions[0].Entry != 0 || Functions[1].Entry != 0 ||
+      !(FL1 ? HasExactOpcodes(Functions[0], FL1RootOpcodes)
+            : HasExactOpcodes(Functions[0], FL0RootOpcodes)) ||
+      !HasExactOpcodes(Functions[1], FLLeafOpcodes))
+    return fail("S3b.8 FL0/FL1 root or helper operation shape is not exact");
+  const MCInst &ExactCall = Functions[0].Instructions[FL1 ? 4 : 2];
+  if (Error E = requireOperands(ExactCall, 3))
+    return E;
+  auto ExactTarget = operand(ExactCall, 0);
+  auto ExactResult = operand(ExactCall, 1);
+  auto ExactArgument = operand(ExactCall, 2);
+  if (!ExactTarget || !ExactResult || !ExactArgument)
+    return joinErrors(
+        ExactTarget.takeError(),
+        joinErrors(ExactResult.takeError(), ExactArgument.takeError()));
+  if (*ExactTarget != 1 || *ExactResult != 4 || *ExactArgument != 4)
+    return fail("S3b.8 direct-call descriptor is not exact leaf1/r4/r4");
+  if (FL1) {
+    const MCInst &ExactStore = Functions[0].Instructions[3];
+    if (Error E = requireOperands(ExactStore, 3))
+      return E;
+    auto ExactSavedSource = operand(ExactStore, 1);
+    if (!ExactSavedSource)
+      return ExactSavedSource.takeError();
+    if (*ExactSavedSource != *ExactArgument)
+      return fail("S3b.8 FrameStore source and Call argument differ");
+  }
+
+  uint64_t RegisterCount = 0;
+  uint64_t OperationCount = 0;
+  for (const S2DirectFunction &Function : Functions) {
+    if (Function.Instructions.empty() || Function.Instructions.size() > 128 ||
+        Function.Entry >= Function.Instructions.size())
+      return fail("direct-call function operation range is invalid");
+    if (!checkedAdd(RegisterCount, Function.RegisterTypes.size(),
+                    RegisterCount) ||
+        !checkedAdd(OperationCount, Function.Instructions.size(),
+                    OperationCount))
+      return fail("direct-call resource count overflow");
+  }
+  if (RegisterCount > 52 || OperationCount > 256)
+    return fail("direct-call module resource limit exceeded");
+
+  SmallVector<Literal, 64> Literals;
+  for (const S2DirectFunction &Function : Functions) {
+    for (const MCInst &Inst : Function.Instructions) {
+      switch (Inst.getOpcode()) {
+      case S2_CONSTANT: {
+        if (Error E = requireOperands(Inst, 3))
+          return E;
+        auto Kind = operand(Inst, 1);
+        auto Value = operand(Inst, 2);
+        if (!Kind || !Value)
+          return joinErrors(Kind.takeError(), Value.takeError());
+        Literals.push_back({false, *Value});
+        break;
+      }
+      case S2_PHYSICAL_ADDRESS: {
+        if (Error E = requireOperands(Inst, 2))
+          return E;
+        auto Address = operand(Inst, 1);
+        if (!Address)
+          return Address.takeError();
+        Literals.push_back({true, *Address});
+        break;
+      }
+      default:
+        break;
+      }
+    }
+  }
+  llvm::sort(Literals);
+  Literals.erase(std::unique(Literals.begin(), Literals.end()), Literals.end());
+  if (Literals.size() > 256)
+    return fail("direct-call literal limit exceeded");
+  const uint64_t RelocationCount =
+      llvm::count_if(Literals, [](const Literal &L) { return L.IsPhysical; });
+  if (RelocationCount > 256)
+    return fail("direct-call relocation limit exceeded");
+
+  std::array<SmallVector<DirectDescriptor, 4>, 2> FunctionDescriptors;
+  uint64_t DescriptorCount = 0;
+  for (unsigned FunctionIndex = 0; FunctionIndex != Functions.size();
+       ++FunctionIndex) {
+    const S2DirectFunction &Function = Functions[FunctionIndex];
+    for (const MCInst &Inst : Function.Instructions) {
+      if (Inst.getOpcode() != S2_DIRECT_CALL)
+        continue;
+      auto Descriptor = directDescriptor(Inst, Functions, Function);
+      if (!Descriptor)
+        return Descriptor.takeError();
+      FunctionDescriptors[FunctionIndex].push_back(*Descriptor);
+    }
+    llvm::sort(FunctionDescriptors[FunctionIndex]);
+    FunctionDescriptors[FunctionIndex].erase(
+        std::unique(FunctionDescriptors[FunctionIndex].begin(),
+                    FunctionDescriptors[FunctionIndex].end()),
+        FunctionDescriptors[FunctionIndex].end());
+    if (FunctionDescriptors[FunctionIndex].size() > 128 ||
+        !checkedAdd(DescriptorCount, FunctionDescriptors[FunctionIndex].size(),
+                    DescriptorCount))
+      return fail("direct-call descriptor limit exceeded");
+  }
+  if (DescriptorCount != 1)
+    return fail("S3b.5 compiler profile requires exactly one descriptor");
+
+  std::array<SmallVector<uint32_t, 128>, 2> FunctionWords;
+  unsigned CallCount = 0;
+  uint64_t BasicBlockCount = 0;
+  uint64_t CFGEdgeCount = 0;
+  uint64_t PhysicalMemoryCount = 0;
+  for (unsigned FunctionIndex = 0; FunctionIndex != Functions.size();
+       ++FunctionIndex) {
+    const S2DirectFunction &Function = Functions[FunctionIndex];
+    auto HasType = [&](uint64_t Register, uint64_t Type) {
+      return Register < Function.RegisterTypes.size() &&
+             Function.RegisterTypes[Register] == Type;
+    };
+    auto HasIntegerType = [&](uint64_t Register) {
+      return Register < Function.RegisterTypes.size() &&
+             (Function.RegisterTypes[Register] == I8 ||
+              Function.RegisterTypes[Register] == I32 ||
+              Function.RegisterTypes[Register] == I64);
+    };
+    auto IsResident = [](uint64_t Register) { return Register < 6; };
+    auto IsHome = [&](uint64_t Register) {
+      return DirectCallHome && FunctionIndex == 0 && Register >= 6 &&
+             Register < Function.RegisterTypes.size();
+    };
+    const unsigned FunctionSize = Function.Instructions.size();
+    if (Function.BlockStarts.empty() || Function.BlockStarts.front() != 0 ||
+        Function.Entry != 0 || Function.BlockStarts.back() >= FunctionSize)
+      return fail("direct-call block-start range is invalid");
+    for (unsigned BlockIndex = 1; BlockIndex != Function.BlockStarts.size();
+         ++BlockIndex)
+      if (Function.BlockStarts[BlockIndex - 1] >=
+          Function.BlockStarts[BlockIndex])
+        return fail("direct-call block starts are not strictly increasing");
+    auto IsBlockStart = [&](uint64_t OperationIndex) {
+      return llvm::binary_search(Function.BlockStarts,
+                                 static_cast<uint32_t>(OperationIndex));
+    };
+    auto BlockForOperation = [&](unsigned OperationIndex) {
+      auto Next = llvm::upper_bound(Function.BlockStarts, OperationIndex);
+      return static_cast<unsigned>(
+          std::distance(Function.BlockStarts.begin(), Next) - 1);
+    };
+    SmallVector<uint32_t, 128> ReadMasks(FunctionSize, 0);
+    SmallVector<uint32_t, 128> DefinitionMasks(FunctionSize, 0);
+    SmallVector<uint32_t, 128> DerivedInputMasks(FunctionSize, 0);
+    SmallVector<uint32_t, 128> SaveReadMasks(FunctionSize, 0);
+    SmallVector<uint32_t, 128> RestoreDefinitionMasks(FunctionSize, 0);
+    SmallVector<uint32_t, 128> PhysicalLoadDefinitionMasks(FunctionSize, 0);
+    SmallVector<uint32_t, 128> ObservableReadMasks(FunctionSize, 0);
+    SmallVector<bool, 128> CallTransfers(FunctionSize, false);
+    SmallVector<bool, 128> Terminators(FunctionSize, false);
+    SmallVector<SmallVector<unsigned, 2>, 128> Successors(FunctionSize);
+    SmallVector<SmallVector<unsigned, 4>, 128> Predecessors(FunctionSize);
+    std::optional<unsigned> CallOperation;
+    std::optional<unsigned> SaveOperation;
+    std::optional<unsigned> RestoreOperation;
+    std::optional<unsigned> FrameEnterOperation;
+    std::optional<unsigned> FrameLeaveOperation;
+    unsigned ReturnCount = 0;
+
+    auto Read = [&](unsigned OperationIndex, uint64_t Register) -> Error {
+      if (Register >= Function.RegisterTypes.size() || Register >= 26)
+        return fail("direct-call read register is out of range");
+      ReadMasks[OperationIndex] |= UINT32_C(1) << Register;
+      return Error::success();
+    };
+    auto Define = [&](unsigned OperationIndex, uint64_t Register) -> Error {
+      if (Register >= Function.RegisterTypes.size() || Register >= 26)
+        return fail("direct-call definition register is out of range");
+      DefinitionMasks[OperationIndex] |= UINT32_C(1) << Register;
+      return Error::success();
+    };
+    auto AddSuccessor = [&](unsigned OperationIndex, uint64_t Target) -> Error {
+      if (Target >= FunctionSize)
+        return fail("direct-call branch target is outside its function");
+      Successors[OperationIndex].push_back(static_cast<unsigned>(Target));
+      Predecessors[Target].push_back(OperationIndex);
+      return Error::success();
+    };
+
+    for (unsigned OperationIndex = 0;
+         OperationIndex != Function.Instructions.size(); ++OperationIndex) {
+      const MCInst &Inst = Function.Instructions[OperationIndex];
+      uint32_t Payload = 0;
+      bool Terminates = false;
+      switch (Inst.getOpcode()) {
+      case S2_CONSTANT: {
+        if (Error E = requireOperands(Inst, 3))
+          return E;
+        auto Destination = operand(Inst, 0);
+        auto Kind = operand(Inst, 1);
+        auto Value = operand(Inst, 2);
+        if (!Destination || !Kind || !Value)
+          return joinErrors(Destination.takeError(),
+                            joinErrors(Kind.takeError(), Value.takeError()));
+        const uint64_t Mask = integerMask(*Kind);
+        if (Mask == 0 || !HasType(*Destination, *Kind) || (*Value & ~Mask) != 0)
+          return fail("invalid direct-call Constant operands");
+        if (DirectCallHome && !IsResident(*Destination))
+          return fail("direct-call home is referenced by Constant");
+        const unsigned LiteralIndex = literalIndex(Literals, {false, *Value});
+        if (LiteralIndex >= 4096)
+          return fail("direct-call Constant literal index overflow");
+        Payload = static_cast<uint32_t>(*Destination | (*Kind << 5) |
+                                        (LiteralIndex << 7));
+        if (Error E = Define(OperationIndex, *Destination))
+          return E;
+        break;
+      }
+      case S2_INTEGER_AND: {
+        if (Error E = requireOperands(Inst, 3))
+          return E;
+        auto Destination = operand(Inst, 0);
+        auto Left = operand(Inst, 1);
+        auto Right = operand(Inst, 2);
+        if (!Destination || !Left || !Right)
+          return joinErrors(Destination.takeError(),
+                            joinErrors(Left.takeError(), Right.takeError()));
+        if (!HasIntegerType(*Destination) ||
+            !HasType(*Left, Function.RegisterTypes[*Destination]) ||
+            !HasType(*Right, Function.RegisterTypes[*Destination]))
+          return fail("invalid direct-call IntegerAnd register types");
+        if (DirectCallHome) {
+          const bool ResidentOnly = IsResident(*Destination) &&
+                                    IsResident(*Left) && IsResident(*Right);
+          const bool Save =
+              IsHome(*Destination) && IsResident(*Left) && *Left == *Right;
+          const bool Restore =
+              IsResident(*Destination) && IsHome(*Left) && *Left == *Right;
+          if (!ResidentOnly && !Save && !Restore)
+            return fail("direct-call home IntegerAnd is not a canonical copy");
+          if (Save) {
+            if (SaveOperation)
+              return fail("direct-call home is saved more than once");
+            SaveOperation = OperationIndex;
+            SaveReadMasks[OperationIndex] = UINT32_C(1) << *Left;
+          }
+          if (Restore) {
+            if (RestoreOperation)
+              return fail("direct-call home is restored more than once");
+            RestoreOperation = OperationIndex;
+            RestoreDefinitionMasks[OperationIndex] = UINT32_C(1)
+                                                     << *Destination;
+          }
+          if (ResidentOnly)
+            DerivedInputMasks[OperationIndex] =
+                (UINT32_C(1) << *Left) | (UINT32_C(1) << *Right);
+        } else if (DirectCallFixedLocal) {
+          DerivedInputMasks[OperationIndex] =
+              (UINT32_C(1) << *Left) | (UINT32_C(1) << *Right);
+        }
+        if (Error E = Read(OperationIndex, *Left))
+          return E;
+        if (Error E = Read(OperationIndex, *Right))
+          return E;
+        Payload = static_cast<uint32_t>(*Destination | (UINT64_C(3) << 5) |
+                                        (*Left << 9) | (*Right << 14));
+        if (Error E = Define(OperationIndex, *Destination))
+          return E;
+        break;
+      }
+      case S2_FRAME_ENTER:
+        if (!DirectCallFixedLocal || FunctionIndex != 0 ||
+            Function.FrameSizeBytes != 16 || FrameEnterOperation ||
+            OperationIndex != Function.Entry)
+          return fail("invalid S3b.8 FrameEnter placement");
+        if (Error E = requireOperands(Inst, 0))
+          return E;
+        FrameEnterOperation = OperationIndex;
+        break;
+      case S2_FRAME_LOAD: {
+        if (!DirectCallFixedLocal || FunctionIndex != 0 ||
+            Function.FrameSizeBytes != 16 || RestoreOperation)
+          return fail("invalid S3b.8 FrameLoad placement");
+        if (Error E = requireOperands(Inst, 3))
+          return E;
+        auto Destination = operand(Inst, 0);
+        auto Offset = operand(Inst, 1);
+        auto Width = operand(Inst, 2);
+        if (!Destination || !Offset || !Width)
+          return joinErrors(Destination.takeError(),
+                            joinErrors(Offset.takeError(), Width.takeError()));
+        if (*Width != U32 || *Offset != 8 || !HasType(*Destination, I32) ||
+            !IsResident(*Destination))
+          return fail("S3b.8 FrameLoad32 operands are not exact");
+        Payload = static_cast<uint32_t>(*Destination | (*Width << 5) |
+                                        (*Offset << 6));
+        if (Error E = Define(OperationIndex, *Destination))
+          return E;
+        RestoreOperation = OperationIndex;
+        RestoreDefinitionMasks[OperationIndex] = UINT32_C(1) << *Destination;
+        break;
+      }
+      case S2_FRAME_STORE: {
+        if (!DirectCallFixedLocal || FunctionIndex != 0 ||
+            Function.FrameSizeBytes != 16 || SaveOperation)
+          return fail("invalid S3b.8 FrameStore placement");
+        if (Error E = requireOperands(Inst, 3))
+          return E;
+        auto Offset = operand(Inst, 0);
+        auto Source = operand(Inst, 1);
+        auto Width = operand(Inst, 2);
+        if (!Offset || !Source || !Width)
+          return joinErrors(Offset.takeError(),
+                            joinErrors(Source.takeError(), Width.takeError()));
+        if (*Width != U32 || *Offset != 8 || !HasType(*Source, I32) ||
+            !IsResident(*Source))
+          return fail("S3b.8 FrameStore32 operands are not exact");
+        if (Error E = Read(OperationIndex, *Source))
+          return E;
+        Payload =
+            static_cast<uint32_t>(*Width | (*Source << 1) | (*Offset << 6));
+        SaveOperation = OperationIndex;
+        SaveReadMasks[OperationIndex] = UINT32_C(1) << *Source;
+        break;
+      }
+      case S2_FRAME_LEAVE:
+        if (!DirectCallFixedLocal || FunctionIndex != 0 ||
+            Function.FrameSizeBytes != 16 || FrameLeaveOperation)
+          return fail("invalid S3b.8 FrameLeave placement");
+        if (Error E = requireOperands(Inst, 0))
+          return E;
+        FrameLeaveOperation = OperationIndex;
+        break;
+      case S2_DIRECT_CALL: {
+        if (FunctionIndex != 0 || ++CallCount != 1)
+          return fail("direct call is outside the exact root profile");
+        if (Error E = requireOperands(Inst, 3))
+          return E;
+        auto ExactTarget = operand(Inst, 0);
+        auto ExactResult = operand(Inst, 1);
+        auto ExactArgument = operand(Inst, 2);
+        if (!ExactTarget || !ExactResult || !ExactArgument)
+          return joinErrors(
+              ExactTarget.takeError(),
+              joinErrors(ExactResult.takeError(), ExactArgument.takeError()));
+        if (*ExactTarget != 1 || *ExactResult != 4 || *ExactArgument != 4)
+          return fail("S3b.8 direct-call descriptor is not exact leaf1/r4/r4");
+        auto Descriptor = directDescriptor(Inst, Functions, Function);
+        if (!Descriptor)
+          return Descriptor.takeError();
+        auto Position =
+            llvm::lower_bound(FunctionDescriptors[FunctionIndex], *Descriptor);
+        if (Position == FunctionDescriptors[FunctionIndex].end() ||
+            *Position != *Descriptor)
+          return fail("direct-call descriptor was not canonicalized");
+        const unsigned DescriptorIndex = static_cast<unsigned>(
+            Position - FunctionDescriptors[FunctionIndex].begin());
+        const uint8_t Result = (*Descriptor)[4];
+        const uint8_t Argument = (*Descriptor)[8];
+        if (DirectCallHome && (!IsResident(Result) || !IsResident(Argument)))
+          return fail("direct-call home is used by Call");
+        if (Error E = Read(OperationIndex, Argument))
+          return E;
+        if (Error E = Define(OperationIndex, Result))
+          return E;
+        CallTransfers[OperationIndex] = true;
+        CallOperation = OperationIndex;
+        Payload = DescriptorIndex;
+        break;
+      }
+      case S2_BRANCH: {
+        if (Error E = requireOperands(Inst, 1))
+          return E;
+        auto Target = operand(Inst, 0);
+        if (!Target)
+          return Target.takeError();
+        if (!IsBlockStart(*Target))
+          return fail("direct-call branch target is not a block start");
+        if (Error E = AddSuccessor(OperationIndex, *Target))
+          return E;
+        Payload = static_cast<uint32_t>(*Target);
+        Terminates = true;
+        break;
+      }
+      case S2_BRANCH_IF: {
+        if (Error E = requireOperands(Inst, 3))
+          return E;
+        auto Condition = operand(Inst, 0);
+        auto TrueTarget = operand(Inst, 1);
+        auto FalseTarget = operand(Inst, 2);
+        if (!Condition || !TrueTarget || !FalseTarget)
+          return joinErrors(
+              Condition.takeError(),
+              joinErrors(TrueTarget.takeError(), FalseTarget.takeError()));
+        if (!HasIntegerType(*Condition) || *TrueTarget == *FalseTarget)
+          return fail("invalid direct-call BranchIf operands");
+        if (DirectCallHome && !IsResident(*Condition))
+          return fail("direct-call home is used by BranchIf");
+        if (!IsBlockStart(*TrueTarget) || !IsBlockStart(*FalseTarget))
+          return fail("direct-call branch target is not a block start");
+        if (Error E = Read(OperationIndex, *Condition))
+          return E;
+        if (Error E = AddSuccessor(OperationIndex, *TrueTarget))
+          return E;
+        if (Error E = AddSuccessor(OperationIndex, *FalseTarget))
+          return E;
+        Payload = static_cast<uint32_t>(*Condition | (*TrueTarget << 5) |
+                                        (*FalseTarget << 12));
+        Terminates = true;
+        break;
+      }
+      case S2_RETURN:
+        if (Error E = requireOperands(Inst, 0))
+          return E;
+        if (FunctionIndex != 0)
+          return fail("void Return is outside the entry terminator");
+        ++ReturnCount;
+        Terminates = true;
+        break;
+      case S2_RETURN_VALUE: {
+        if (Error E = requireOperands(Inst, 1))
+          return E;
+        auto Value = operand(Inst, 0);
+        if (!Value)
+          return Value.takeError();
+        if (FunctionIndex != 1 || !HasType(*Value, I32))
+          return fail("valued Return is outside the i32 leaf terminator");
+        if (DirectCallHome && !IsResident(*Value))
+          return fail("direct-call home is used by Return");
+        if (Error E = Read(OperationIndex, *Value))
+          return E;
+        Payload = static_cast<uint32_t>(*Value | (UINT64_C(1) << 5));
+        ++ReturnCount;
+        Terminates = true;
+        break;
+      }
+      case S2_PHYSICAL_ADDRESS: {
+        if (Error E = requireOperands(Inst, 2))
+          return E;
+        auto Destination = operand(Inst, 0);
+        auto Address = operand(Inst, 1);
+        if (!Destination || !Address)
+          return joinErrors(Destination.takeError(), Address.takeError());
+        if (!HasType(*Destination, PADDR))
+          return fail("invalid direct-call PhysicalAddress destination");
+        if (DirectCallHome && !IsResident(*Destination))
+          return fail("direct-call home is referenced by PhysicalAddress");
+        const unsigned LiteralIndex = literalIndex(Literals, {true, *Address});
+        if (LiteralIndex >= 4096)
+          return fail("direct-call PhysicalAddress literal index overflow");
+        Payload = static_cast<uint32_t>(*Destination | (LiteralIndex << 5));
+        if (Error E = Define(OperationIndex, *Destination))
+          return E;
+        break;
+      }
+      case S2_PHYSICAL_LOAD: {
+        if (++PhysicalMemoryCount > 64)
+          return fail(
+              "direct-call module physical memory operation limit exceeded");
+        if (Error E = requireOperands(Inst, 3))
+          return E;
+        auto Destination = operand(Inst, 0);
+        auto Width = operand(Inst, 1);
+        auto Address = operand(Inst, 2);
+        if (!Destination || !Width || !Address)
+          return joinErrors(Destination.takeError(),
+                            joinErrors(Width.takeError(), Address.takeError()));
+        const uint64_t ExpectedType = *Width == U8 ? I8 : I32;
+        if ((*Width != U8 && *Width != U32) ||
+            !HasType(*Destination, ExpectedType) || !HasType(*Address, PADDR))
+          return fail("invalid direct-call PhysicalLoad operands");
+        if (DirectCallHome &&
+            (!IsResident(*Destination) || !IsResident(*Address)))
+          return fail("direct-call home is referenced by PhysicalLoad");
+        if (Error E = Read(OperationIndex, *Address))
+          return E;
+        Payload = static_cast<uint32_t>(*Destination | (*Width << 5) |
+                                        (*Address << 6));
+        if (Error E = Define(OperationIndex, *Destination))
+          return E;
+        if ((DirectCallHome || DirectCallFixedLocal) && *Width == U32)
+          PhysicalLoadDefinitionMasks[OperationIndex] = UINT32_C(1)
+                                                        << *Destination;
+        break;
+      }
+      case S2_PHYSICAL_STORE: {
+        if (++PhysicalMemoryCount > 64)
+          return fail(
+              "direct-call module physical memory operation limit exceeded");
+        if (Error E = requireOperands(Inst, 3))
+          return E;
+        auto Width = operand(Inst, 0);
+        auto Address = operand(Inst, 1);
+        auto Source = operand(Inst, 2);
+        if (!Width || !Address || !Source)
+          return joinErrors(Width.takeError(), joinErrors(Address.takeError(),
+                                                          Source.takeError()));
+        const uint64_t ExpectedType = *Width == U8 ? I8 : I32;
+        if ((*Width != U8 && *Width != U32) || !HasType(*Address, PADDR) ||
+            !HasType(*Source, ExpectedType))
+          return fail("invalid direct-call PhysicalStore operands");
+        if (DirectCallHome && (!IsResident(*Address) || !IsResident(*Source)))
+          return fail("direct-call home is referenced by PhysicalStore");
+        if (Error E = Read(OperationIndex, *Address))
+          return E;
+        if (Error E = Read(OperationIndex, *Source))
+          return E;
+        if (DirectCallHome || DirectCallFixedLocal)
+          ObservableReadMasks[OperationIndex] = UINT32_C(1) << *Source;
+        Payload =
+            static_cast<uint32_t>(*Width | (*Address << 1) | (*Source << 6));
+        break;
+      }
+      default:
+        return fail("unsupported direct-call MC opcode");
+      }
+      auto EncodingOpcode = directEncodingOpcode(Inst.getOpcode());
+      if (!EncodingOpcode)
+        return EncodingOpcode.takeError();
+      FunctionWords[FunctionIndex].push_back(
+          packWord(*EncodingOpcode, Payload));
+      Terminators[OperationIndex] = Terminates;
+      if (!Terminates) {
+        if (OperationIndex + 1 == FunctionSize)
+          return fail("direct-call function falls past its operation range");
+        if (Error E = AddSuccessor(OperationIndex, OperationIndex + 1))
+          return E;
+      }
+    }
+
+    if (ReturnCount == 0)
+      return fail("direct-call function has no Return");
+    if (DirectCallHome && FunctionIndex == 0) {
+      const bool H1 = Function.RegisterTypes.size() == RequiredHomeTypes.size();
+      if (H1 && (!CallOperation || !SaveOperation || !RestoreOperation ||
+                 *SaveOperation + 1 != *CallOperation ||
+                 *CallOperation + 1 != *RestoreOperation))
+        return fail("direct-call H1 save/Call/restore placement is not exact");
+      if (!H1 && (SaveOperation || RestoreOperation))
+        return fail("direct-call H0 contains a home transfer");
+    }
+    if (DirectCallFixedLocal) {
+      if (ReturnCount != 1)
+        return fail("S3b.8 function requires exactly one Return");
+      if (!Predecessors[Function.Entry].empty())
+        return fail("S3b.8 entry operation has a predecessor or backedge");
+      if (FunctionIndex == 0 && Function.FrameSizeBytes == 16) {
+        if (!FrameEnterOperation || !SaveOperation || !CallOperation ||
+            !RestoreOperation || !FrameLeaveOperation ||
+            *FrameEnterOperation != Function.Entry ||
+            *SaveOperation + 1 != *CallOperation ||
+            *CallOperation + 1 != *RestoreOperation ||
+            *FrameLeaveOperation + 1 >= FunctionSize ||
+            Function.Instructions[*FrameLeaveOperation + 1].getOpcode() !=
+                S2_RETURN ||
+            BlockForOperation(*FrameEnterOperation) != 0 ||
+            BlockForOperation(*SaveOperation) !=
+                BlockForOperation(*CallOperation) ||
+            BlockForOperation(*CallOperation) !=
+                BlockForOperation(*RestoreOperation) ||
+            BlockForOperation(*FrameLeaveOperation) !=
+                BlockForOperation(*FrameLeaveOperation + 1))
+          return fail("S3b.8 FL1 frame lifecycle is not exact");
+      } else if (FrameEnterOperation || SaveOperation || RestoreOperation ||
+                 FrameLeaveOperation) {
+        return fail("S3b.8 zero-frame function contains a Frame operation");
+      }
+    }
+
+    // BlockStarts is the target-owned MachineBasicBlock-to-serialized-word
+    // mapping.  Validate it against the flattened operation/tick carriers and
+    // derive every explicit or implicit-fallthrough block edge before
+    // publication.
+    const uint64_t FunctionBlockCount = Function.BlockStarts.size();
+    uint64_t FunctionEdgeCount = 0;
+    for (unsigned BlockIndex = 0; BlockIndex != Function.BlockStarts.size();
+         ++BlockIndex) {
+      const unsigned Start = Function.BlockStarts[BlockIndex];
+      const unsigned End = BlockIndex + 1 == Function.BlockStarts.size()
+                               ? FunctionSize
+                               : Function.BlockStarts[BlockIndex + 1];
+      if (Start == End)
+        return fail("direct-call block is empty");
+      for (unsigned OperationIndex = Start; OperationIndex + 1 != End;
+           ++OperationIndex)
+        if (Terminators[OperationIndex])
+          return fail("direct-call terminator precedes its block end");
+      const unsigned Last = End - 1;
+      if (Terminators[Last]) {
+        if (!checkedAdd(FunctionEdgeCount, Successors[Last].size(),
+                        FunctionEdgeCount))
+          return fail("direct-call CFG edge count overflow");
+      } else {
+        if (End == FunctionSize || Successors[Last].size() != 1 ||
+            Successors[Last][0] != End)
+          return fail("direct-call block fallthrough is not canonical");
+        if (!checkedAdd(FunctionEdgeCount, UINT64_C(1), FunctionEdgeCount))
+          return fail("direct-call CFG edge count overflow");
+      }
+    }
+    if (FunctionBlockCount > 4 || FunctionEdgeCount > 8)
+      return fail("direct-call function CFG resource limit exceeded");
+    if (!checkedAdd(BasicBlockCount, FunctionBlockCount, BasicBlockCount) ||
+        !checkedAdd(CFGEdgeCount, FunctionEdgeCount, CFGEdgeCount))
+      return fail("direct-call module CFG resource count overflow");
+    if (BasicBlockCount > 8 || CFGEdgeCount > 16)
+      return fail("direct-call module CFG resource limit exceeded");
+
+    SmallVector<bool, 128> Reachable(FunctionSize, false);
+    SmallVector<unsigned, 128> Worklist{Function.Entry};
+    while (!Worklist.empty()) {
+      const unsigned OperationIndex = Worklist.pop_back_val();
+      if (Reachable[OperationIndex])
+        continue;
+      Reachable[OperationIndex] = true;
+      llvm::append_range(Worklist, Successors[OperationIndex]);
+    }
+    if (llvm::any_of(Reachable, [](bool Value) { return !Value; }))
+      return fail("direct-call function contains an unreachable operation");
+
+    const uint32_t AllRegisters =
+        (UINT32_C(1) << Function.RegisterTypes.size()) - 1;
+    uint32_t EntryState = 0;
+    for (uint8_t Parameter : Function.ParameterSlots)
+      EntryState |= UINT32_C(1) << Parameter;
+    SmallVector<uint32_t, 128> In(FunctionSize, AllRegisters);
+    SmallVector<uint32_t, 128> Out(FunctionSize, AllRegisters);
+    auto Transfer = [&](unsigned OperationIndex, uint32_t State) {
+      if (CallTransfers[OperationIndex] && DirectCallHome)
+        return (State & ~UINT32_C(0x3f)) | DefinitionMasks[OperationIndex];
+      if (CallTransfers[OperationIndex])
+        return DefinitionMasks[OperationIndex];
+      return State | DefinitionMasks[OperationIndex];
+    };
+    In[Function.Entry] = EntryState;
+    Out[Function.Entry] = Transfer(Function.Entry, EntryState);
+    bool Changed = true;
+    unsigned Iterations = 0;
+    while (Changed) {
+      if (++Iterations > 512)
+        return fail("direct-call definition analysis did not converge");
+      Changed = false;
+      for (unsigned OperationIndex = 0; OperationIndex != FunctionSize;
+           ++OperationIndex) {
+        uint32_t NewIn = EntryState;
+        if (OperationIndex != Function.Entry) {
+          NewIn = AllRegisters;
+          if (Predecessors[OperationIndex].empty())
+            return fail("direct-call non-entry operation has no predecessor");
+          for (unsigned Predecessor : Predecessors[OperationIndex])
+            NewIn &= Out[Predecessor];
+        }
+        const uint32_t NewOut = Transfer(OperationIndex, NewIn);
+        if (In[OperationIndex] != NewIn || Out[OperationIndex] != NewOut) {
+          In[OperationIndex] = NewIn;
+          Out[OperationIndex] = NewOut;
+          Changed = true;
+        }
+      }
+    }
+    for (unsigned OperationIndex = 0; OperationIndex != FunctionSize;
+         ++OperationIndex)
+      if ((ReadMasks[OperationIndex] & ~In[OperationIndex]) != 0)
+        return fail("direct-call register is read before definition");
+
+    if ((DirectCallHome || DirectCallFixedLocal) && FunctionIndex == 0 &&
+        RestoreOperation) {
+      struct HomeFlowState {
+        uint32_t Tainted = 0;
+        uint32_t CallTainted = 0;
+        uint32_t LoadDerived = 0;
+        bool Observed = false;
+        bool JointlyObserved = false;
+        bool SavedLoad = false;
+
+        bool operator==(const HomeFlowState &Other) const {
+          return Tainted == Other.Tainted && CallTainted == Other.CallTainted &&
+                 LoadDerived == Other.LoadDerived &&
+                 Observed == Other.Observed &&
+                 JointlyObserved == Other.JointlyObserved &&
+                 SavedLoad == Other.SavedLoad;
+        }
+      };
+      auto TransferHomeFlow = [&](unsigned OperationIndex,
+                                  HomeFlowState State) {
+        if ((ObservableReadMasks[OperationIndex] & State.Tainted) != 0)
+          State.Observed = true;
+        if ((ObservableReadMasks[OperationIndex] & State.Tainted &
+             State.CallTainted) != 0)
+          State.JointlyObserved = true;
+        if ((SaveReadMasks[OperationIndex] & State.LoadDerived) != 0)
+          State.SavedLoad = true;
+        uint32_t ResultTaint = 0;
+        uint32_t ResultCallTaint = 0;
+        uint32_t ResultLoadDerived = 0;
+        if ((DerivedInputMasks[OperationIndex] & State.Tainted) != 0)
+          ResultTaint = DefinitionMasks[OperationIndex];
+        if ((DerivedInputMasks[OperationIndex] & State.LoadDerived) != 0)
+          ResultLoadDerived = DefinitionMasks[OperationIndex];
+        if ((DerivedInputMasks[OperationIndex] & State.CallTainted) != 0)
+          ResultCallTaint = DefinitionMasks[OperationIndex];
+        State.Tainted &= ~DefinitionMasks[OperationIndex];
+        State.Tainted |= ResultTaint;
+        State.CallTainted &= ~DefinitionMasks[OperationIndex];
+        State.CallTainted |= ResultCallTaint;
+        State.LoadDerived &= ~DefinitionMasks[OperationIndex];
+        State.LoadDerived |= ResultLoadDerived;
+        State.LoadDerived |= PhysicalLoadDefinitionMasks[OperationIndex];
+        State.Tainted |= RestoreDefinitionMasks[OperationIndex];
+        if (CallTransfers[OperationIndex]) {
+          State.Tainted &= ~UINT32_C(0x3f);
+          State.CallTainted &= ~UINT32_C(0x3f);
+          State.CallTainted |= DefinitionMasks[OperationIndex];
+          State.LoadDerived &= ~UINT32_C(0x3f);
+        }
+        return State;
+      };
+
+      constexpr HomeFlowState Universal{
+          UINT32_C(0x3f), UINT32_C(0x3f), UINT32_C(0x3f), true, true, true};
+      SmallVector<HomeFlowState, 128> FlowIn(FunctionSize, Universal);
+      SmallVector<HomeFlowState, 128> FlowOut(FunctionSize, Universal);
+      FlowIn[Function.Entry] = {};
+      FlowOut[Function.Entry] = TransferHomeFlow(Function.Entry, {});
+      Changed = true;
+      Iterations = 0;
+      while (Changed) {
+        if (++Iterations > 512)
+          return fail("direct-call restored-home flow did not converge");
+        Changed = false;
+        for (unsigned OperationIndex = 0; OperationIndex != FunctionSize;
+             ++OperationIndex) {
+          HomeFlowState NewIn{};
+          if (OperationIndex != Function.Entry) {
+            NewIn = Universal;
+            if (Predecessors[OperationIndex].empty())
+              return fail("direct-call non-entry operation has no predecessor");
+            for (unsigned Predecessor : Predecessors[OperationIndex]) {
+              NewIn.Tainted &= FlowOut[Predecessor].Tainted;
+              NewIn.CallTainted &= FlowOut[Predecessor].CallTainted;
+              NewIn.LoadDerived &= FlowOut[Predecessor].LoadDerived;
+              NewIn.Observed = NewIn.Observed && FlowOut[Predecessor].Observed;
+              NewIn.JointlyObserved =
+                  NewIn.JointlyObserved && FlowOut[Predecessor].JointlyObserved;
+              NewIn.SavedLoad =
+                  NewIn.SavedLoad && FlowOut[Predecessor].SavedLoad;
+            }
+          }
+          const HomeFlowState NewOut = TransferHomeFlow(OperationIndex, NewIn);
+          if (!(FlowIn[OperationIndex] == NewIn) ||
+              !(FlowOut[OperationIndex] == NewOut)) {
+            FlowIn[OperationIndex] = NewIn;
+            FlowOut[OperationIndex] = NewOut;
+            Changed = true;
+          }
+        }
+      }
+      for (unsigned OperationIndex = 0; OperationIndex != FunctionSize;
+           ++OperationIndex)
+        if (Function.Instructions[OperationIndex].getOpcode() == S2_RETURN &&
+            (!FlowOut[OperationIndex].SavedLoad ||
+             !(DirectCallFixedLocal ? FlowOut[OperationIndex].JointlyObserved
+                                    : FlowOut[OperationIndex].Observed)))
+          return fail(!FlowOut[OperationIndex].SavedLoad
+                          ? "saved home does not originate from a physical "
+                            "i32 load"
+                      : DirectCallFixedLocal
+                          ? "Call result and FrameLoad do not jointly reach "
+                            "one observable physical store"
+                          : "restored home does not reach an observable "
+                            "physical store");
+    }
+
+    if (FunctionIndex == 0 && CallOperation) {
+      SmallVector<bool, 128> BeforeCall(FunctionSize, false);
+      Worklist.clear();
+      Worklist.push_back(Function.Entry);
+      while (!Worklist.empty()) {
+        const unsigned OperationIndex = Worklist.pop_back_val();
+        if (BeforeCall[OperationIndex])
+          continue;
+        BeforeCall[OperationIndex] = true;
+        if (OperationIndex == *CallOperation)
+          continue;
+        if (Function.Instructions[OperationIndex].getOpcode() == S2_RETURN)
+          return fail("entry can Return before its direct call");
+        llvm::append_range(Worklist, Successors[OperationIndex]);
+      }
+      SmallVector<bool, 128> AfterCall(FunctionSize, false);
+      Worklist.clear();
+      llvm::append_range(Worklist, Successors[*CallOperation]);
+      while (!Worklist.empty()) {
+        const unsigned OperationIndex = Worklist.pop_back_val();
+        if (OperationIndex == *CallOperation)
+          return fail("entry direct call can execute more than once");
+        if (AfterCall[OperationIndex])
+          continue;
+        AfterCall[OperationIndex] = true;
+        llvm::append_range(Worklist, Successors[OperationIndex]);
+      }
+
+      // Reconstruct the semantic provenance of the returned r4 rather than
+      // accepting any later r4 read.  The three-bit union lattice retains all
+      // path states at joins: the original result is either unconsumed,
+      // consumed, or already overwritten.  Every reachable root Return must
+      // see only consumed paths, and no reachable path may overwrite the
+      // result before its first read.
+      constexpr uint8_t Unconsumed = UINT8_C(1) << 0;
+      constexpr uint8_t Consumed = UINT8_C(1) << 1;
+      constexpr uint8_t Overwritten = UINT8_C(1) << 2;
+      constexpr uint32_t ResultRegister = UINT32_C(1) << 4;
+      SmallVector<uint8_t, 128> ResultIn(FunctionSize, 0);
+      SmallVector<uint8_t, 128> ResultOut(FunctionSize, 0);
+      Changed = true;
+      Iterations = 0;
+      while (Changed) {
+        if (++Iterations > 512)
+          return fail(
+              "direct-call result provenance analysis did not converge");
+        Changed = false;
+        for (unsigned OperationIndex = 0; OperationIndex != FunctionSize;
+             ++OperationIndex) {
+          if (!AfterCall[OperationIndex])
+            continue;
+          uint8_t NewIn = 0;
+          for (unsigned Predecessor : Predecessors[OperationIndex]) {
+            if (Predecessor == *CallOperation)
+              NewIn |= Unconsumed;
+            else if (AfterCall[Predecessor])
+              NewIn |= ResultOut[Predecessor];
+          }
+          uint8_t NewOut = NewIn;
+          if ((NewOut & Unconsumed) != 0) {
+            if ((ReadMasks[OperationIndex] & ResultRegister) != 0) {
+              NewOut = static_cast<uint8_t>((NewOut & ~Unconsumed) | Consumed);
+            } else if ((DefinitionMasks[OperationIndex] & ResultRegister) !=
+                       0) {
+              NewOut =
+                  static_cast<uint8_t>((NewOut & ~Unconsumed) | Overwritten);
+            }
+          }
+          if (ResultIn[OperationIndex] != NewIn ||
+              ResultOut[OperationIndex] != NewOut) {
+            ResultIn[OperationIndex] = NewIn;
+            ResultOut[OperationIndex] = NewOut;
+            Changed = true;
+          }
+        }
+      }
+      for (unsigned OperationIndex = 0; OperationIndex != FunctionSize;
+           ++OperationIndex) {
+        if (!AfterCall[OperationIndex])
+          continue;
+        if ((ResultOut[OperationIndex] & Overwritten) != 0)
+          return fail("direct-call result is overwritten before consumption");
+        if (Function.Instructions[OperationIndex].getOpcode() == S2_RETURN &&
+            ResultOut[OperationIndex] != Consumed)
+          return fail(
+              "direct-call result is not consumed on every root exit path");
+      }
+    }
+  }
+  if (CallCount != 1)
+    return fail("S3b.5 compiler profile requires exactly one direct call");
+
+  DirectLayout L;
+  if (!computeDirectLayout(Functions.size(), RegisterCount, OperationCount,
+                           DescriptorCount, Literals.size(), RelocationCount,
+                           L))
+    return fail("direct-call object layout overflow");
+  if (L.TotalSize > 1048576)
+    return fail("direct-call object size limit exceeded");
+
+  std::vector<uint8_t> Bytes(L.TotalSize, 0);
+  Bytes[0] = 0x7f;
+  Bytes[1] = 'E';
+  Bytes[2] = 'L';
+  Bytes[3] = 'F';
+  Bytes[4] = 2;
+  Bytes[5] = 1;
+  Bytes[6] = 1;
+  Bytes[7] = ExperimentalOSABI;
+  storeU16(Bytes, 16, 1);
+  storeU16(Bytes, 18, ExperimentalMachine);
+  storeU32(Bytes, 20, 1);
+  storeU64(Bytes, 40, L.SectionHeadersOffset);
+  storeU32(Bytes, 48,
+           DirectCallFixedLocal ? DirectByteFrameExperimentalFlags
+           : DirectCallHome     ? DirectHomeExperimentalFlags
+                                : DirectExperimentalFlags);
   storeU16(Bytes, 52, 64);
   storeU16(Bytes, 58, 64);
   storeU16(Bytes, 60, DirectSectionCount);

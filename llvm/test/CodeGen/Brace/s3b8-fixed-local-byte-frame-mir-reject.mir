@@ -1,0 +1,548 @@
+# REQUIRES: brace-registered-target
+#
+# Every serialized S3b.8 seam is untrusted.  This test constructs the sole
+# admitted FI1 ordinal-equivalence carrier, replays it through all five seams,
+# and mutates lifetime/local/MFI/MMO/final/publication/resource identities one
+# at a time.  A reject must be stable, nonzero, and publish no nonempty object.
+#
+# DEFINE: %{brace-s3b8-llc} = llc -mtriple=brace64-unknown-none-elf \
+# DEFINE:   -target-abi=brace-system-s2-direct-call-byte-frame-fixed-local-r0 \
+# DEFINE:   -O1 -verify-machineinstrs -filetype=obj
+# DEFINE: %{brace-s3b7c-llc} = llc -mtriple=brace64-unknown-none-elf \
+# DEFINE:   -target-abi=brace-system-s2-direct-call-byte-frame-r0 \
+# DEFINE:   -O1 -verify-machineinstrs -filetype=obj
+#
+# RUN: rm -rf %t.parts %t.ir
+# RUN: split-file %s %t.parts
+# RUN: split-file %S/s3b8-fixed-local-byte-frame.ll %t.ir
+# RUN: llvm-as %t.ir/fl1.ll -o %t.fl1.bc
+# RUN: %{brace-s3b8-llc} %t.fl1.bc -o %t.canonical.o
+# RUN: %{brace-s3b8-llc} -stop-after=finalize-isel %t.fl1.bc -o %t.isel.mir
+# RUN: %{brace-s3b8-llc} -stop-after=virtregrewriter %t.fl1.bc -o %t.ra.mir
+# RUN: %{brace-s3b8-llc} -stop-after=stack-slot-coloring %t.fl1.bc -o %t.color.mir
+# RUN: %{brace-s3b8-llc} \
+# RUN:   -stop-after=brace-finalize-fixed-local-byte-frame %t.fl1.bc \
+# RUN:   -o %t.frame.mir
+# RUN: %{brace-s3b8-llc} -stop-after=brace-finalize-branches %t.fl1.bc \
+# RUN:   -o %t.final.mir
+#
+# Construct one exact metadata-only spill bookkeeping FI0 before local FI1.
+# It must survive the first three serialized seams and disappear before the
+# fourth; every restart converges on the natural-FI0 canonical object.
+# RUN: %python %t.parts/construct-fi1.py 1 %t.isel.mir %t.fi1.isel.mir
+# RUN: FileCheck %s --check-prefix=FI1-PRE < %t.fi1.isel.mir
+# RUN: %{brace-s3b8-llc} -start-after=finalize-isel \
+# RUN:   -stop-after=virtregrewriter %t.fi1.isel.mir -o %t.fi1.ra.mir
+# RUN: FileCheck %s --check-prefix=FI1-PRE < %t.fi1.ra.mir
+# RUN: %{brace-s3b8-llc} -start-after=virtregrewriter \
+# RUN:   -stop-after=stack-slot-coloring %t.fi1.ra.mir -o %t.fi1.color.mir
+# RUN: FileCheck %s --check-prefix=FI1-PRE < %t.fi1.color.mir
+# RUN: %{brace-s3b8-llc} -start-after=stack-slot-coloring \
+# RUN:   -stop-after=brace-finalize-fixed-local-byte-frame %t.fi1.color.mir \
+# RUN:   -o %t.fi1.frame.mir
+# RUN: FileCheck %s --check-prefix=FI1-POST < %t.fi1.frame.mir
+# RUN: %{brace-s3b8-llc} \
+# RUN:   -start-after=brace-finalize-fixed-local-byte-frame \
+# RUN:   -stop-after=brace-finalize-branches %t.fi1.frame.mir \
+# RUN:   -o %t.fi1.final.mir
+# RUN: FileCheck %s --check-prefix=FI1-POST < %t.fi1.final.mir
+# RUN: %{brace-s3b8-llc} -start-after=finalize-isel %t.fi1.isel.mir \
+# RUN:   -o %t.fi1.from-isel.o
+# RUN: %{brace-s3b8-llc} -start-after=virtregrewriter %t.fi1.ra.mir \
+# RUN:   -o %t.fi1.from-ra.o
+# RUN: %{brace-s3b8-llc} -start-after=stack-slot-coloring %t.fi1.color.mir \
+# RUN:   -o %t.fi1.from-color.o
+# RUN: %{brace-s3b8-llc} \
+# RUN:   -start-after=brace-finalize-fixed-local-byte-frame %t.fi1.frame.mir \
+# RUN:   -o %t.fi1.from-frame.o
+# RUN: %{brace-s3b8-llc} -start-after=brace-finalize-branches \
+# RUN:   %t.fi1.final.mir -o %t.fi1.from-final.o
+# RUN: cmp %t.canonical.o %t.fi1.from-isel.o
+# RUN: cmp %t.canonical.o %t.fi1.from-ra.o
+# RUN: cmp %t.canonical.o %t.fi1.from-color.o
+# RUN: cmp %t.canonical.o %t.fi1.from-frame.o
+# RUN: cmp %t.canonical.o %t.fi1.from-final.o
+#
+# FI1 is the sole ordinal exception: two leading records, a wrong bookkeeping
+# field, a reference to FI0, or a following record are all rejected.
+# RUN: %python %t.parts/construct-fi1.py 2 %t.ra.mir %t.fi2.ra.mir
+# RUN: not --crash %{brace-s3b8-llc} -start-after=virtregrewriter \
+# RUN:   %t.fi2.ra.mir -o %t.fi2.o 2>&1 | FileCheck %s --check-prefix=BOOKKEEPING
+# RUN: test ! -s %t.fi2.o
+# RUN: %python %t.parts/mutate.py bookkeeping-size %t.fi1.ra.mir \
+# RUN:   %t.fi1.bad-size.mir
+# RUN: not --crash %{brace-s3b8-llc} -start-after=virtregrewriter \
+# RUN:   %t.fi1.bad-size.mir -o %t.fi1.bad-size.o 2>&1 | \
+# RUN:   FileCheck %s --check-prefix=BOOKKEEPING
+# RUN: test ! -s %t.fi1.bad-size.o
+# RUN: %python %t.parts/mutate.py bookkeeping-ref %t.fi1.ra.mir \
+# RUN:   %t.fi1.ref.mir
+# RUN: not --crash %{brace-s3b8-llc} -start-after=virtregrewriter \
+# RUN:   %t.fi1.ref.mir -o %t.fi1.ref.o 2>&1 | \
+# RUN:   FileCheck %s --check-prefix=BOOKKEEPING-REF
+# RUN: test ! -s %t.fi1.ref.o
+# RUN: %python %t.parts/mutate.py following-record %t.ra.mir \
+# RUN:   %t.following.mir
+# RUN: not --crash %{brace-s3b8-llc} -start-after=virtregrewriter \
+# RUN:   %t.following.mir -o %t.following.o 2>&1 | \
+# RUN:   FileCheck %s --check-prefix=BOOKKEEPING
+# RUN: test ! -s %t.following.o
+#
+# Pre-final lifetime/local/MFI/MMO carriers remain exact.  These cases cover
+# missing/extra/reordered markers, ordinary-vs-spill provenance, private MFI
+# offset drift, local MMO drift, a FixedStack MMO, and an Alloca-backed MMO
+# laundered onto an otherwise nonlocal instruction.
+# RUN: %python %t.parts/mutate.py local-spill %t.ra.mir %t.local-spill.mir
+# RUN: not --crash %{brace-s3b8-llc} -start-after=virtregrewriter \
+# RUN:   %t.local-spill.mir -o %t.local-spill.o 2>&1 | \
+# RUN:   FileCheck %s --check-prefix=LOCAL-MFI
+# RUN: test ! -s %t.local-spill.o
+# RUN: %python %t.parts/mutate.py local-size %t.ra.mir %t.local-size.mir
+# RUN: not --crash %{brace-s3b8-llc} -start-after=virtregrewriter \
+# RUN:   %t.local-size.mir -o %t.local-size.o 2>&1 | \
+# RUN:   FileCheck %s --check-prefix=LOCAL-MFI
+# RUN: test ! -s %t.local-size.o
+# RUN: %python %t.parts/mutate.py local-offset %t.ra.mir %t.local-offset.mir
+# RUN: not --crash %{brace-s3b8-llc} -start-after=virtregrewriter \
+# RUN:   %t.local-offset.mir -o %t.local-offset.o 2>&1 | \
+# RUN:   FileCheck %s --check-prefix=LOCAL-MFI
+# RUN: test ! -s %t.local-offset.o
+# RUN: %python %t.parts/mutate.py missing-start %t.ra.mir %t.missing-start.mir
+# RUN: not --crash %{brace-s3b8-llc} -start-after=virtregrewriter \
+# RUN:   %t.missing-start.mir -o %t.missing-start.o 2>&1 | \
+# RUN:   FileCheck %s --check-prefix=LIFETIME-COUNT
+# RUN: test ! -s %t.missing-start.o
+# RUN: %python %t.parts/mutate.py duplicate-end %t.ra.mir %t.duplicate-end.mir
+# RUN: not --crash %{brace-s3b8-llc} -start-after=virtregrewriter \
+# RUN:   %t.duplicate-end.mir -o %t.duplicate-end.o 2>&1 | \
+# RUN:   FileCheck %s --check-prefix=LIFETIME-COUNT
+# RUN: test ! -s %t.duplicate-end.o
+# RUN: %python %t.parts/mutate.py reordered-start %t.ra.mir %t.reordered-start.mir
+# RUN: not --crash %{brace-s3b8-llc} -start-after=virtregrewriter \
+# RUN:   %t.reordered-start.mir -o %t.reordered-start.o 2>&1 | \
+# RUN:   FileCheck %s --check-prefix=LOCAL-ADJACENCY
+# RUN: test ! -s %t.reordered-start.o
+# RUN: %python %t.parts/mutate.py local-mmo-nonvolatile %t.ra.mir \
+# RUN:   %t.local-mmo-nonvolatile.mir
+# RUN: not --crash %{brace-s3b8-llc} -start-after=virtregrewriter \
+# RUN:   %t.local-mmo-nonvolatile.mir -o %t.local-mmo-nonvolatile.o 2>&1 | \
+# RUN:   FileCheck %s --check-prefix=LOCAL-MMO
+# RUN: test ! -s %t.local-mmo-nonvolatile.o
+# RUN: %python %t.parts/mutate.py local-mmo-fixed %t.fi1.ra.mir \
+# RUN:   %t.local-mmo-fixed.mir
+# RUN: not --crash %{brace-s3b8-llc} -start-after=virtregrewriter \
+# RUN:   %t.local-mmo-fixed.mir -o %t.local-mmo-fixed.o 2>&1 | \
+# RUN:   FileCheck %s --check-prefix=LOCAL-MMO
+# RUN: test ! -s %t.local-mmo-fixed.o
+# RUN: %python %t.parts/mutate.py nonlocal-local-mmo %t.ra.mir \
+# RUN:   %t.nonlocal-local-mmo.mir
+# RUN: not --crash %{brace-s3b8-llc} -start-after=virtregrewriter \
+# RUN:   %t.nonlocal-local-mmo.mir -o %t.nonlocal-local-mmo.o 2>&1 | \
+# RUN:   FileCheck %s --check-prefix=NONLOCAL-LOCAL-MMO
+# RUN: test ! -s %t.nonlocal-local-mmo.o
+# RUN: %python %t.parts/mutate.py spill-local %t.ra.mir %t.spill-local.mir
+# RUN: not --crash %{brace-s3b8-llc} -start-after=virtregrewriter \
+# RUN:   %t.spill-local.mir -o %t.spill-local.o 2>&1 | \
+# RUN:   FileCheck %s --check-prefix=SPILL-LOCAL
+# RUN: test ! -s %t.spill-local.o
+# RUN: %python %t.parts/mutate.py pre-frame %t.ra.mir %t.pre-frame.mir
+# RUN: not --crash %{brace-s3b8-llc} -start-after=virtregrewriter \
+# RUN:   %t.pre-frame.mir -o %t.pre-frame.o 2>&1 | \
+# RUN:   FileCheck %s --check-prefix=PRE-FRAME
+# RUN: test ! -s %t.pre-frame.o
+#
+# Serialized post-final restarts intentionally begin with stack: [] and an
+# empty target MFI.  They regenerate the private tag only after revalidating
+# final MIR.  Restored MFI/FI/MMO/lifetime state is rejected.
+# RUN: %{brace-s3b8-llc} \
+# RUN:   -start-after=brace-finalize-fixed-local-byte-frame %t.frame.mir \
+# RUN:   -o %t.empty-mfi-restart.o
+# RUN: cmp %t.canonical.o %t.empty-mfi-restart.o
+# RUN: %python %t.parts/mutate.py live-stack %t.frame.mir %t.live-stack.mir
+# RUN: not --crash %{brace-s3b8-llc} \
+# RUN:   -start-after=brace-finalize-fixed-local-byte-frame %t.live-stack.mir \
+# RUN:   -o %t.live-stack.o 2>&1 | FileCheck %s --check-prefix=POST-LIVE-MFI
+# RUN: test ! -s %t.live-stack.o
+# RUN: %python %t.parts/mutate.py post-fi %t.frame.mir %t.post-fi.mir
+# RUN: not --crash %{brace-s3b8-llc} \
+# RUN:   -start-after=brace-finalize-fixed-local-byte-frame %t.post-fi.mir \
+# RUN:   -o %t.post-fi.o 2>&1 | FileCheck %s --check-prefix=POST-LIVE-MFI
+# RUN: test ! -s %t.post-fi.o
+# RUN: %python %t.parts/mutate.py post-mmo %t.frame.mir %t.post-mmo.mir
+# RUN: not --crash %{brace-s3b8-llc} \
+# RUN:   -start-after=brace-finalize-fixed-local-byte-frame %t.post-mmo.mir \
+# RUN:   -o %t.post-mmo.o 2>&1 | FileCheck %s --check-prefix=POST-LIVE-MFI
+# RUN: test ! -s %t.post-mmo.o
+# RUN: %python %t.parts/mutate.py post-lifetime %t.frame.mir \
+# RUN:   %t.post-lifetime.mir
+# RUN: not --crash %{brace-s3b8-llc} \
+# RUN:   -start-after=brace-finalize-fixed-local-byte-frame \
+# RUN:   %t.post-lifetime.mir -o %t.post-lifetime.o 2>&1 | \
+# RUN:   FileCheck %s --check-prefix=POST-LIVE-MFI
+# RUN: test ! -s %t.post-lifetime.o
+#
+# Offset 8 is identity-local and literal.  Offset 4 remains predecessor-only;
+# frame-size drift, either non-8 offset, final extra operations, and lifecycle
+# order drift are rejected at the post/final publication boundaries.
+# RUN: %python %t.parts/mutate.py offset4 %t.frame.mir %t.offset4.mir
+# RUN: not --crash %{brace-s3b8-llc} \
+# RUN:   -start-after=brace-finalize-fixed-local-byte-frame %t.offset4.mir \
+# RUN:   -o %t.offset4.o 2>&1 | FileCheck %s --check-prefix=OFFSET8
+# RUN: test ! -s %t.offset4.o
+# RUN: %python %t.parts/mutate.py offset16 %t.frame.mir %t.offset16.mir
+# RUN: not --crash %{brace-s3b8-llc} \
+# RUN:   -start-after=brace-finalize-fixed-local-byte-frame %t.offset16.mir \
+# RUN:   -o %t.offset16.o 2>&1 | FileCheck %s --check-prefix=OFFSET8
+# RUN: test ! -s %t.offset16.o
+# RUN: %python %t.parts/mutate.py frame-size %t.frame.mir %t.frame-size.mir
+# RUN: not --crash %{brace-s3b8-llc} \
+# RUN:   -start-after=brace-finalize-fixed-local-byte-frame %t.frame-size.mir \
+# RUN:   -o %t.frame-size.o 2>&1 | FileCheck %s --check-prefix=FRAME-SIZE
+# RUN: test ! -s %t.frame-size.o
+# RUN: %python %t.parts/mutate.py final-extra %t.final.mir %t.final-extra.mir
+# RUN: not --crash %{brace-s3b8-llc} -start-after=brace-finalize-branches \
+# RUN:   %t.final-extra.mir -o %t.final-extra.o 2>&1 | \
+# RUN:   FileCheck %s --check-prefix=FINAL-EXTRA
+# RUN: test ! -s %t.final-extra.o
+# RUN: %python %t.parts/mutate.py no-leave %t.final.mir %t.no-leave.mir
+# RUN: not --crash %{brace-s3b8-llc} -start-after=brace-finalize-branches \
+# RUN:   %t.no-leave.mir -o %t.no-leave.o 2>&1 | \
+# RUN:   FileCheck %s --check-prefix=FINAL-SHAPE
+# RUN: test ! -s %t.no-leave.o
+# RUN: %python %t.parts/mutate.py store-after-call %t.final.mir \
+# RUN:   %t.store-after-call.mir
+# RUN: not --crash %{brace-s3b8-llc} -start-after=brace-finalize-branches \
+# RUN:   %t.store-after-call.mir -o %t.store-after-call.o 2>&1 | \
+# RUN:   FileCheck %s --check-prefix=FINAL-ORDER
+# RUN: test ! -s %t.store-after-call.o
+#
+# Resource preflight is distinct from final exact-shape validation.  Base 11
+# plus 115 operations reaches pre-final 126 and therefore the exact root-shape
+# error; base plus 116 reaches 127 and fails the reserved Enter/Leave check
+# first.  Neither negative publishes bytes.
+# RUN: %python %t.parts/resource.py 115 %t.ra.mir %t.resource-126.mir
+# RUN: not --crash %{brace-s3b8-llc} -start-after=virtregrewriter \
+# RUN:   %t.resource-126.mir -o %t.resource-126.o 2>&1 | \
+# RUN:   FileCheck %s --check-prefix=RESOURCE-SHAPE
+# RUN: test ! -s %t.resource-126.o
+# RUN: %python %t.parts/resource.py 116 %t.ra.mir %t.resource-127.mir
+# RUN: not --crash %{brace-s3b8-llc} -start-after=virtregrewriter \
+# RUN:   %t.resource-127.mir -o %t.resource-127.o 2>&1 | \
+# RUN:   FileCheck %s --check-prefix=RESOURCE-RESERVE
+# RUN: test ! -s %t.resource-127.o
+#
+# The final-publication verifier is not a sixth restart seam.  The four
+# target-owned verifier wrappers remain even when the CLI automatic verifier
+# is disabled.  The old offset-4 identity remains byte-frozen and accepted.
+# RUN: %{brace-s3b8-llc} \
+# RUN:   -stop-after=brace-verify-final-fixed-local-publication %t.fl1.bc \
+# RUN:   -o %t.publication.mir
+# RUN: not --crash %{brace-s3b8-llc} \
+# RUN:   -start-after=brace-verify-final-fixed-local-publication \
+# RUN:   %t.publication.mir -o %t.publication.o 2>&1 | \
+# RUN:   FileCheck %s --check-prefix=UNREGISTERED-RESTART
+# RUN: test ! -s %t.publication.o
+# RUN: not --crash %{brace-s3b8-llc} \
+# RUN:   -start-after=virtregrewriter -start-after=virtregrewriter \
+# RUN:   %t.ra.mir -o %t.duplicate-start-after.o 2>&1 | \
+# RUN:   FileCheck %s --check-prefix=DUPLICATE-START-AFTER
+# RUN: test ! -s %t.duplicate-start-after.o
+# RUN: not --crash %{brace-s3b8-llc} -start-after= %t.ra.mir \
+# RUN:   -o %t.empty-start-after.o 2>&1 | \
+# RUN:   FileCheck %s --check-prefix=EMPTY-START-AFTER
+# RUN: test ! -s %t.empty-start-after.o
+# RUN: not --crash %{brace-s3b8-llc} \
+# RUN:   -stop-after=virtregrewriter -stop-after=virtregrewriter %t.fl1.bc \
+# RUN:   -o %t.duplicate-stop-after.o 2>&1 | \
+# RUN:   FileCheck %s --check-prefix=DUPLICATE-STOP-AFTER
+# RUN: test ! -s %t.duplicate-stop-after.o
+# RUN: not --crash %{brace-s3b8-llc} -stop-after= %t.fl1.bc \
+# RUN:   -o %t.empty-stop-after.o 2>&1 | \
+# RUN:   FileCheck %s --check-prefix=EMPTY-STOP-AFTER
+# RUN: test ! -s %t.empty-stop-after.o
+# RUN: not --crash %{brace-s3b8-llc} \
+# RUN:   -start-after=virtregrewriter -start-before=virtregrewriter %t.ra.mir \
+# RUN:   -o %t.start-before.o 2>&1 | FileCheck %s --check-prefix=START-BEFORE
+# RUN: test ! -s %t.start-before.o
+# RUN: not --crash %{brace-s3b8-llc} \
+# RUN:   -stop-before=virtregrewriter %t.fl1.bc \
+# RUN:   -o %t.stop-before.o 2>&1 | FileCheck %s --check-prefix=STOP-BEFORE
+# RUN: test ! -s %t.stop-before.o
+# RUN: not --crash %{brace-s3b8-llc} \
+# RUN:   -stop-after=machine-opt-remark-emitter,2 %t.fl1.bc \
+# RUN:   -o %t.unregistered-stop.o 2>&1 | \
+# RUN:   FileCheck %s --check-prefix=UNREGISTERED-STOP
+# RUN: test ! -s %t.unregistered-stop.o
+# RUN: not %{brace-s3b8-llc} -start-after=finalize-isel \
+# RUN:   %t.fl1.bc -o %t.raw-start-after.o 2>&1 | \
+# RUN:   FileCheck %s --check-prefix=RAW-START-AFTER
+# RUN: test ! -s %t.raw-start-after.o
+# RUN: not %{brace-s3b8-llc} %t.ra.mir -o %t.mir-without-start.o 2>&1 | \
+# RUN:   FileCheck %s --check-prefix=MIR-WITHOUT-START
+# RUN: test ! -s %t.mir-without-start.o
+# RUN: not --crash %{brace-s3b8-llc} -start-after=virtregrewriter \
+# RUN:   -stop-after=finalize-isel %t.ra.mir -o %t.reverse-pair.o 2>&1 | \
+# RUN:   FileCheck %s --check-prefix=PAIR-REJECT
+# RUN: test ! -s %t.reverse-pair.o
+# RUN: not --crash %{brace-s3b8-llc} -start-after=virtregrewriter \
+# RUN:   -stop-after=virtregrewriter %t.ra.mir -o %t.same-pair.o 2>&1 | \
+# RUN:   FileCheck %s --check-prefix=PAIR-REJECT
+# RUN: test ! -s %t.same-pair.o
+# RUN: not --crash %{brace-s3b8-llc} -start-after=finalize-isel \
+# RUN:   -stop-after=stack-slot-coloring %t.isel.mir \
+# RUN:   -o %t.long-pair.o 2>&1 | FileCheck %s --check-prefix=PAIR-REJECT
+# RUN: test ! -s %t.long-pair.o
+# RUN: not --crash %{brace-s3b8-llc} \
+# RUN:   -start-after=brace-finalize-branches \
+# RUN:   -stop-after=brace-verify-final-fixed-local-publication %t.final.mir \
+# RUN:   -o %t.audit-pair.o 2>&1 | FileCheck %s --check-prefix=PAIR-REJECT
+# RUN: test ! -s %t.audit-pair.o
+# RUN: not --crash %{brace-s3b8-llc} -start-after=finalize-isel \
+# RUN:   -stop-after=machine-opt-remark-emitter,2 %t.isel.mir \
+# RUN:   -o %t.unregistered-pair.o 2>&1 | \
+# RUN:   FileCheck %s --check-prefix=PAIR-REJECT
+# RUN: test ! -s %t.unregistered-pair.o
+# RUN: not %{brace-s3b8-llc} -run-pass=none %t.fl1.bc \
+# RUN:   -o %t.run-pass.o 2>&1 | FileCheck %s --check-prefix=PIPELINE-OPTION
+# RUN: test ! -s %t.run-pass.o
+# RUN: not %{brace-s3b8-llc} -run-pass= %t.fl1.bc \
+# RUN:   -o %t.empty-run-pass.o 2>&1 | FileCheck %s --check-prefix=PIPELINE-OPTION
+# RUN: test ! -s %t.empty-run-pass.o
+# RUN: not %{brace-s3b8-llc} -passes=none %t.fl1.bc \
+# RUN:   -o %t.passes.o 2>&1 | FileCheck %s --check-prefix=PIPELINE-OPTION
+# RUN: test ! -s %t.passes.o
+# RUN: not %{brace-s3b8-llc} -passes= %t.fl1.bc \
+# RUN:   -o %t.empty-passes.o 2>&1 | FileCheck %s --check-prefix=PIPELINE-OPTION
+# RUN: test ! -s %t.empty-passes.o
+# RUN: not %{brace-s3b8-llc} -enable-new-pm %t.fl1.bc \
+# RUN:   -o %t.enable-new-pm.o 2>&1 | \
+# RUN:   FileCheck %s --check-prefix=PIPELINE-OPTION
+# RUN: test ! -s %t.enable-new-pm.o
+# RUN: not %{brace-s3b8-llc} -enable-new-pm=false %t.fl1.bc \
+# RUN:   -o %t.disable-new-pm.o 2>&1 | \
+# RUN:   FileCheck %s --check-prefix=PIPELINE-OPTION
+# RUN: test ! -s %t.disable-new-pm.o
+# RUN: %{brace-s3b8-llc} -verify-machineinstrs=false \
+# RUN:   -start-after=virtregrewriter -debug-pass=Structure %t.ra.mir \
+# RUN:   -o %t.no-auto-verifier.o 2> %t.pipeline.log
+# RUN: FileCheck %s --check-prefix=PIPELINE < %t.pipeline.log
+# RUN: grep -F 'Verify generated machine code' %t.pipeline.log | count 4
+# RUN: cmp %t.canonical.o %t.no-auto-verifier.o
+# RUN: %{brace-s3b7c-llc} %S/s3b7c-direct-call-byte-frame.ll -o %t.old-bf1.o
+# RUN: %python -c "import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" %t.old-bf1.o | FileCheck %s --check-prefix=OLD-BF1-SHA
+#
+# FI1-PRE-LABEL: name: brace_system_entry
+# FI1-PRE: stack:
+# FI1-PRE-NEXT: - { id: 0,{{( name: '',)? }}type: spill-slot, offset: 0, size: 4, alignment: 4
+# FI1-PRE: - { id: 1, name: local, type: default, offset: 0, size: 4, alignment: 4,
+# FI1-PRE: LIFETIME_START %stack.1.local
+# FI1-PRE: LOCAL_STORE32 {{.*}}, %stack.1.local
+# FI1-PRE: LOCAL_LOAD32 %stack.1.local
+# FI1-PRE: LIFETIME_END %stack.1.local
+# FI1-POST-LABEL: name: brace_system_entry
+# FI1-POST: stack: []
+# FI1-POST: machineFunctionInfo: {}
+# FI1-POST: FRAME_ENTER 16
+# FI1-POST: FRAME_STORE32 8, $r4
+# FI1-POST-NEXT: CALL_I32
+# FI1-POST-NEXT: $r5 = FRAME_LOAD32 8
+# FI1-POST-NOT: %stack.
+#
+# BOOKKEEPING: LLVM ERROR: brace64 S3b.8 fixed-local finalizer: frame object is neither the natural local nor exact FI1 restart bookkeeping
+# BOOKKEEPING-REF: LLVM ERROR: brace64 S3b.8 fixed-local finalizer: local carriers disagree on their frame index
+# LOCAL-MFI: LLVM ERROR: brace64 S3b.8 fixed-local finalizer: carrier does not refer to the exact live ordinary i32 local
+# LIFETIME-COUNT: LLVM ERROR: brace64 S3b.8 fixed-local finalizer: FL1 requires one start/store/call/load/end carrier sequence
+# LOCAL-ADJACENCY: LLVM ERROR: brace64 S3b.8 fixed-local finalizer: FL1 local carrier adjacency is not exact
+# LOCAL-MMO: LLVM ERROR: brace64 S3b.8 fixed-local finalizer: local carrier lost its exact volatile i32 IR-backed MMO
+# NONLOCAL-LOCAL-MMO: LLVM ERROR: brace64 S3b.8 fixed-local finalizer: nonlocal instruction carries the fixed-local MMO
+# SPILL-LOCAL: LLVM ERROR: brace64 S3b.8 fixed-local finalizer: allocator spill is forbidden by the fixed-local profile
+# PRE-FRAME: LLVM ERROR: brace64 S3b.8 fixed-local finalizer: semantic frame operation appeared before finalization
+# POST-LIVE-MFI: LLVM ERROR: brace64 S3b.8 post-fixed-local-byte-frame verifier: live, allocated, aliased, or nondefault frame object survived finalization
+# POST-PRIVATE: LLVM ERROR: brace64 S3b.8 post-fixed-local-byte-frame verifier: private local/spill/lifetime carrier survived publication
+# OFFSET8: LLVM ERROR: brace64 S3b.8 post-fixed-local-byte-frame verifier: FrameStore32 is not exact fixed-local offset=8
+# FRAME-SIZE: LLVM ERROR: brace64 S3b.8 post-fixed-local-byte-frame verifier: FrameEnter is not exact frame_size=16
+# FINAL-EXTRA: LLVM ERROR: brace64 S3b.8 post-fixed-local-byte-frame verifier: FL1 root operation count is not exact eleven
+# FINAL-SHAPE: LLVM ERROR: brace64 S3b.8 post-fixed-local-byte-frame verifier: FL1 requires one Enter, Store32, Load32, and Leave
+# FINAL-ORDER: LLVM ERROR: brace64 S3b.8 post-fixed-local-byte-frame verifier: FL1 requires FrameStore32(8), Call, FrameLoad32(8) adjacency
+# RESOURCE-SHAPE: LLVM ERROR: brace64 S3b.8 fixed-local finalizer: FL0/FL1 pre-finalization root operation count is not exact
+# RESOURCE-RESERVE: LLVM ERROR: brace64 S3b.8 fixed-local finalizer: FL1 cannot reserve Enter/Leave within the operation limit
+# UNREGISTERED-RESTART: LLVM ERROR: brace64 S3b.8 fixed-local selector: -start-after=brace-verify-final-fixed-local-publication is not one of the five registered restart seams
+# DUPLICATE-START-AFTER: LLVM ERROR: brace64 S3b.8 fixed-local selector: -start-after is specified more than once
+# EMPTY-START-AFTER: LLVM ERROR: brace64 S3b.8 fixed-local selector: -start-after requires a nonempty pass name
+# DUPLICATE-STOP-AFTER: LLVM ERROR: brace64 S3b.8 fixed-local selector: -stop-after is specified more than once
+# EMPTY-STOP-AFTER: LLVM ERROR: brace64 S3b.8 fixed-local selector: -stop-after requires a nonempty pass name
+# START-BEFORE: LLVM ERROR: brace64 S3b.8 fixed-local selector: -start-before=virtregrewriter is not an admitted restart boundary
+# STOP-BEFORE: LLVM ERROR: brace64 S3b.8 fixed-local selector: -stop-before=virtregrewriter is not an admitted stop boundary
+# UNREGISTERED-STOP: LLVM ERROR: brace64 S3b.8 fixed-local selector: -stop-after=machine-opt-remark-emitter,2 is neither one of the five registered restart seams nor the audit-only final-publication stop
+# RAW-START-AFTER: error: brace64 S3b.8 fixed-local selector: explicit -start-after requires MIR input
+# MIR-WITHOUT-START: error: brace64 S3b.8 fixed-local selector: MIR input requires one explicit registered -start-after
+# PAIR-REJECT: LLVM ERROR: brace64 S3b.8 fixed-local selector: start/stop pass-limit pair is not one of the four registered forward propagation pairs
+# PIPELINE-OPTION: error: brace64 S3b.8 fixed-local selector: explicit -run-pass, -passes, or -enable-new-pm is outside the registered pipeline
+# PIPELINE: Pass Arguments:
+# PIPELINE-SAME: -stack-slot-coloring
+# PIPELINE-SAME: -machineverifier -brace-finalize-fixed-local-byte-frame -machineverifier -brace-verify-post-fixed-local-byte-frame
+# PIPELINE-SAME: -stack-frame-layout -machineverifier -brace-finalize-branches -machineverifier -brace-verify-final-fixed-local-publication
+# OLD-BF1-SHA: cb09ac307141381c709d1504bab2f74b274a0b50e42b20cad593f9bf2846fb55
+
+#--- construct-fi1.py
+from pathlib import Path
+import sys
+
+assert len(sys.argv) == 4
+dead_count = int(sys.argv[1])
+assert dead_count in (1, 2)
+source = Path(sys.argv[2]).read_text()
+root_marker = "name:            brace_system_entry\n"
+leaf_marker = "name:            brace_system_call_leaf\n"
+assert source.count(root_marker) == 1
+assert source.count(leaf_marker) == 1
+root_start = source.index(root_marker)
+root_end = source.index(leaf_marker, root_start)
+root = source[root_start:root_end]
+stack_start = root.index("stack:\n")
+stack_end = root.index("entry_values:", stack_start)
+stack = root[stack_start:stack_end]
+assert stack.count("  - { id: 0, name: local, type: default,") == 1
+assert stack.count("  - { id:") == 1
+local = stack.replace("id: 0", f"id: {dead_count}", 1)
+bookkeeping = "".join(
+    f"  - {{ id: {i}, type: spill-slot, offset: 0, size: 4, alignment: 4 }}\n"
+    for i in range(dead_count))
+stack = "stack:\n" + bookkeeping + local[len("stack:\n"):]
+root = root[:stack_start] + stack + root[stack_end:]
+body_start = root.index("body:")
+assert root[:body_start].count("%stack.0") == 0
+assert root[body_start:].count("%stack.0.local") == 4
+root = root[:body_start] + root[body_start:].replace(
+    "%stack.0.local", f"%stack.{dead_count}.local")
+result = source[:root_start] + root + source[root_end:]
+Path(sys.argv[3]).write_text(result)
+
+#--- mutate.py
+from pathlib import Path
+import sys
+
+assert len(sys.argv) == 4
+mode, source_path, output_path = sys.argv[1:]
+text = Path(source_path).read_text()
+root_marker = "name:            brace_system_entry\n"
+leaf_marker = "name:            brace_system_call_leaf\n"
+assert text.count(root_marker) == 1
+assert text.count(leaf_marker) == 1
+root_start = text.index(root_marker)
+root_end = text.index(leaf_marker, root_start)
+root = text[root_start:root_end]
+
+def once(old, new):
+    global root
+    assert root.count(old) == 1, (mode, old, root.count(old))
+    root = root.replace(old, new, 1)
+
+def add_stack():
+    once("stack:           []\n",
+         "stack:\n"
+         "  - { id: 0, type: spill-slot, offset: 0, size: 4, alignment: 4 }\n")
+
+if mode == "bookkeeping-size":
+    once("type: spill-slot, offset: 0, size: 4, alignment: 4",
+         "type: spill-slot, offset: 0, size: 8, alignment: 4")
+elif mode == "bookkeeping-ref":
+    once("    LIFETIME_START %stack.1.local\n",
+         "    LIFETIME_START %stack.0\n")
+elif mode == "following-record":
+    anchor = ("      debug-info-variable: '', debug-info-expression: '', "
+              "debug-info-location: '' }\n")
+    once(anchor, anchor +
+         "  - { id: 1, type: spill-slot, offset: 0, size: 4, alignment: 4 }\n")
+elif mode == "local-spill":
+    once("name: local, type: default", "name: local, type: spill-slot")
+elif mode == "local-size":
+    once("name: local, type: default, offset: 0, size: 4, alignment: 4",
+         "name: local, type: default, offset: 0, size: 8, alignment: 4")
+elif mode == "local-offset":
+    once("name: local, type: default, offset: 0, size: 4, alignment: 4",
+         "name: local, type: default, offset: 4, size: 4, alignment: 4")
+elif mode == "missing-start":
+    once("    LIFETIME_START %stack.0.local\n", "")
+elif mode == "duplicate-end":
+    line = "    LIFETIME_END %stack.0.local\n"
+    once(line, line + line)
+elif mode == "reordered-start":
+    start = "    LIFETIME_START %stack.0.local\n"
+    store = ("    LOCAL_STORE32 $r4, %stack.0.local :: "
+             "(volatile store (s32) into %ir.local)\n")
+    once(start, "")
+    once(store, store + start)
+elif mode == "local-mmo-nonvolatile":
+    once("(volatile store (s32) into %ir.local)",
+         "(store (s32) into %ir.local)")
+elif mode == "local-mmo-fixed":
+    once("(volatile store (s32) into %ir.local)",
+         "(volatile store (s32) into %stack.0)")
+elif mode == "nonlocal-local-mmo":
+    line = next(line for line in root.splitlines(keepends=True)
+                if line.startswith("    $r4 = LOAD32 killed $r0 :: "))
+    once(line, line.rstrip("\n") + ", (load (s32) from %ir.local)\n")
+elif mode == "spill-local":
+    once("    LOCAL_STORE32 $r4, %stack.0.local ::",
+         "    SPILL_STORE32 $r4, %stack.0.local ::")
+elif mode == "pre-frame":
+    line = next(line for line in root.splitlines(keepends=True)
+                if line.startswith("    LOCAL_STORE32 $r4,"))
+    once(line, "    FRAME_STORE32 8, $r4\n")
+elif mode == "live-stack":
+    add_stack()
+elif mode == "post-fi":
+    add_stack()
+    once("    FRAME_STORE32 8, $r4\n",
+         "    FRAME_STORE32 %stack.0, $r4\n")
+elif mode == "post-mmo":
+    add_stack()
+    once("    FRAME_STORE32 8, $r4\n",
+         "    FRAME_STORE32 8, $r4 :: (store (s32) into %stack.0)\n")
+elif mode == "post-lifetime":
+    add_stack()
+    once("    FRAME_ENTER 16\n",
+         "    FRAME_ENTER 16\n    LIFETIME_START %stack.0\n")
+elif mode == "offset4":
+    once("    FRAME_STORE32 8, $r4\n", "    FRAME_STORE32 4, $r4\n")
+    once("    $r5 = FRAME_LOAD32 8\n", "    $r5 = FRAME_LOAD32 4\n")
+elif mode == "offset16":
+    once("    FRAME_STORE32 8, $r4\n", "    FRAME_STORE32 16, $r4\n")
+    once("    $r5 = FRAME_LOAD32 8\n", "    $r5 = FRAME_LOAD32 16\n")
+elif mode == "frame-size":
+    once("    FRAME_ENTER 16\n", "    FRAME_ENTER 32\n")
+elif mode == "final-extra":
+    once("    FRAME_ENTER 16\n",
+         "    FRAME_ENTER 16\n    $r5 = CONST32 0\n")
+elif mode == "no-leave":
+    once("    FRAME_LEAVE\n", "")
+elif mode == "store-after-call":
+    store = "    FRAME_STORE32 8, $r4\n"
+    call = ("    CALL_I32 @brace_system_call_leaf, csr_noregs, "
+            "implicit-def $r4, implicit $r4\n")
+    once(store, "")
+    once(call, call + store)
+else:
+    raise AssertionError(mode)
+
+Path(output_path).write_text(text[:root_start] + root + text[root_end:])
+
+#--- resource.py
+from pathlib import Path
+import sys
+
+assert len(sys.argv) == 4
+count = int(sys.argv[1])
+assert count in (115, 116)
+text = Path(sys.argv[2]).read_text()
+root_marker = "name:            brace_system_entry\n"
+leaf_marker = "name:            brace_system_call_leaf\n"
+root_start = text.index(root_marker)
+root_end = text.index(leaf_marker, root_start)
+root = text[root_start:root_end]
+anchor = "  bb.0.entry:\n"
+assert root.count(anchor) == 1
+extra = "".join("    $r5 = CONST32 0\n" for _ in range(count))
+root = root.replace(anchor, anchor + extra, 1)
+Path(sys.argv[3]).write_text(text[:root_start] + root + text[root_end:])

@@ -11,6 +11,7 @@
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
@@ -46,10 +47,20 @@ constexpr StringLiteral RequiredDataLayout =
   report_fatal_error("brace64 S3b.7c direct-call-byte-frame ABI: " + Message);
 }
 
+[[noreturn]] void rejectDirectFixedLocal(const Twine &Message) {
+  report_fatal_error("brace64 S3b.8 direct-call-byte-frame-fixed-local ABI: " +
+                     Message);
+}
+
 bool isDirectCallABIName(StringRef ABI) {
   return ABI == BraceSdagDirectCallABIName ||
          ABI == BraceSdagDirectCallHomeABIName ||
-         ABI == BraceSdagDirectCallByteFrameABIName;
+         ABI == BraceSdagDirectCallByteFrameABIName ||
+         ABI == BraceSdagDirectCallByteFrameFixedLocalABIName;
+}
+
+bool isFixedLocalABIName(StringRef ABI) {
+  return ABI == BraceSdagDirectCallByteFrameFixedLocalABIName;
 }
 
 bool metadataI32Equals(const Metadata *MD, uint32_t Expected) {
@@ -169,6 +180,78 @@ void checkDirectMemory(const StoreInst &Store) {
         "stores must be volatile direct addrspace(200) i8/i32 accesses");
   checkDirectMemoryShape(Store.getValueOperand()->getType(),
                          Store.getPointerOperand(), Store.getAlign());
+}
+
+const AllocaInst *fixedLocalAlloca(const Value *Pointer) {
+  return dyn_cast<AllocaInst>(Pointer->stripPointerCasts());
+}
+
+void checkFixedLocalMemory(const LoadInst &Load) {
+  const AllocaInst *Alloca = fixedLocalAlloca(Load.getPointerOperand());
+  if (!Alloca || !Load.getType()->isIntegerTy(32) || !Load.isVolatile() ||
+      Load.isAtomic() || Load.getAlign() != Align(4))
+    rejectDirectFixedLocal(
+        "local load is not one exact volatile aligned i32 alloca access");
+}
+
+void checkFixedLocalMemory(const StoreInst &Store) {
+  const AllocaInst *Alloca = fixedLocalAlloca(Store.getPointerOperand());
+  if (!Alloca || !Store.getValueOperand()->getType()->isIntegerTy(32) ||
+      !Store.isVolatile() || Store.isAtomic() || Store.getAlign() != Align(4))
+    rejectDirectFixedLocal(
+        "local store is not one exact volatile aligned i32 alloca access");
+}
+
+bool isFixedLocalLifetime(const CallInst &Call) {
+  const Function *Callee = Call.getCalledFunction();
+  if (!Callee)
+    return false;
+  const Intrinsic::ID ID = Callee->getIntrinsicID();
+  return ID == Intrinsic::lifetime_start || ID == Intrinsic::lifetime_end;
+}
+
+void checkFixedLocalLifetimeDeclaration(const Function &F) {
+  const Intrinsic::ID ID = F.getIntrinsicID();
+  const AttributeList &Attrs = F.getAttributes();
+  const AttributeSet FnAttrs = Attrs.getFnAttrs();
+  const AttributeSet ParamAttrs = Attrs.getParamAttrs(0);
+  const Attribute Captures = ParamAttrs.getAttribute(Attribute::Captures);
+  const Attribute Memory = FnAttrs.getAttribute(Attribute::Memory);
+  if ((ID != Intrinsic::lifetime_start && ID != Intrinsic::lifetime_end) ||
+      !F.isDeclaration() || !F.getReturnType()->isVoidTy() || F.isVarArg() ||
+      F.arg_size() != 1 || !F.getArg(0)->getType()->isPointerTy() ||
+      F.getArg(0)->getType()->getPointerAddressSpace() != 0 ||
+      F.getCallingConv() != CallingConv::C ||
+      Attrs.getRetAttrs().getNumAttributes() != 0 ||
+      ParamAttrs.getNumAttributes() != 1 || !Captures.isValid() ||
+      !capturesNothing(Captures.getCaptureInfo()) ||
+      (FnAttrs.getNumAttributes() != 6 && FnAttrs.getNumAttributes() != 7) ||
+      (FnAttrs.getNumAttributes() == 7 &&
+       !F.hasFnAttribute(Attribute::MustProgress)) ||
+      !F.hasFnAttribute(Attribute::NoCallback) ||
+      !F.hasFnAttribute(Attribute::NoFree) ||
+      !F.hasFnAttribute(Attribute::NoSync) ||
+      !F.hasFnAttribute(Attribute::NoUnwind) ||
+      !F.hasFnAttribute(Attribute::WillReturn) || !Memory.isValid() ||
+      Memory.getMemoryEffects() != MemoryEffects::argMemOnly())
+    rejectDirectFixedLocal(
+        "lifetime declaration signature or attributes are not exact");
+}
+
+void checkFixedLocalLifetimeCall(const CallInst &Call,
+                                 const AllocaInst *Local) {
+  const AttributeList &Attrs = Call.getAttributes();
+  const AttributeSet ParamAttrs = Attrs.getParamAttrs(0);
+  if (!isFixedLocalLifetime(Call) || !Call.getType()->isVoidTy() ||
+      Call.getCallingConv() != CallingConv::C || Call.isTailCall() ||
+      Call.hasOperandBundles() || Call.isInlineAsm() || Call.arg_size() != 1 ||
+      Call.getArgOperand(0) != Local ||
+      Attrs.getFnAttrs().getNumAttributes() != 0 ||
+      Attrs.getRetAttrs().getNumAttributes() != 0 ||
+      ParamAttrs.getNumAttributes() != 1 ||
+      !ParamAttrs.hasAttribute(Attribute::NonNull))
+    rejectDirectFixedLocal(
+        "lifetime callsite spelling or nonnull operand is not exact");
 }
 
 void checkFunctionAttributes(const Function &F) {
@@ -385,6 +468,19 @@ bool hasDirectPhysicalMemory(const Function &F) {
   return false;
 }
 
+bool hasFixedLocalPhysicalMemory(const Function &F) {
+  for (const BasicBlock &Block : F)
+    for (const Instruction &I : Block) {
+      if (const auto *Load = dyn_cast<LoadInst>(&I))
+        if (Load->getPointerAddressSpace() == 200)
+          return true;
+      if (const auto *Store = dyn_cast<StoreInst>(&I))
+        if (Store->getPointerAddressSpace() == 200)
+          return true;
+    }
+  return false;
+}
+
 void checkDirectFunctionAttributes(const Function &F, bool IsHelper,
                                    bool HasPhysicalEffects) {
   const AttributeList &Attrs = F.getAttributes();
@@ -577,13 +673,18 @@ struct DirectCounts final {
 DirectCounts checkDirectFunction(const Function &F, const Function &Helper,
                                  bool IsHelper, bool HasPhysicalEffects,
                                  bool AllowsCallLiveHome = false,
-                                 bool AllowsCallLiveByteFrame = false) {
+                                 bool AllowsCallLiveByteFrame = false,
+                                 bool AllowsFixedLocal = false) {
   checkDirectFunctionHeader(F, IsHelper, HasPhysicalEffects);
   if (F.empty() || F.size() > 4)
     rejectDirect("basic-block count is outside 1..4");
-  if (AllowsCallLiveByteFrame && !F.getEntryBlock().hasNPredecessors(0))
-    rejectDirectByteFrame(
-        "function entry block must not have a predecessor or backedge");
+  if ((AllowsCallLiveByteFrame || AllowsFixedLocal) &&
+      !F.getEntryBlock().hasNPredecessors(0))
+    AllowsFixedLocal
+        ? rejectDirectFixedLocal(
+              "function entry block must not have a predecessor or backedge")
+        : rejectDirectByteFrame(
+              "function entry block must not have a predecessor or backedge");
 
   SmallPtrSet<const BasicBlock *, 4> Reachable;
   SmallVector<const BasicBlock *, 4> Worklist{&F.getEntryBlock()};
@@ -631,13 +732,41 @@ DirectCounts checkDirectFunction(const Function &F, const Function &Helper,
       if (++Counts.Instructions > 128)
         rejectDirect("IR instruction count exceeds 128");
       checkDirectInstructionMetadata(I);
+      if (const auto *Alloca = dyn_cast<AllocaInst>(&I)) {
+        if (AllowsFixedLocal) {
+          const auto *Count = dyn_cast<ConstantInt>(Alloca->getArraySize());
+          if (IsHelper || !Alloca->isStaticAlloca() ||
+              !Alloca->getAllocatedType()->isIntegerTy(32) || !Count ||
+              !Count->isOne() || Alloca->getAlign() != Align(4) ||
+              Alloca->getAddressSpace() != 0)
+            rejectDirectFixedLocal(
+                "local allocation is not one exact entry i32 alloca");
+          continue;
+        }
+      }
       if (const auto *Load = dyn_cast<LoadInst>(&I)) {
+        if (AllowsFixedLocal && Load->getPointerAddressSpace() == 0) {
+          if (IsHelper)
+            rejectDirectFixedLocal("helper cannot access an AS0 local");
+          checkFixedLocalMemory(*Load);
+          continue;
+        }
         if (++Counts.Memory > 64)
           rejectDirect("physical memory operation count exceeds 64");
         checkDirectMemory(*Load);
         continue;
       }
       if (const auto *Store = dyn_cast<StoreInst>(&I)) {
+        if (AllowsFixedLocal && Store->getPointerAddressSpace() == 0) {
+          if (IsHelper)
+            rejectDirectFixedLocal("helper cannot access an AS0 local");
+          if (!IsInteger(Store->getValueOperand(),
+                         Store->getValueOperand()->getType()))
+            rejectDirectFixedLocal(
+                "local store is outside the exact integer graph");
+          checkFixedLocalMemory(*Store);
+          continue;
+        }
         if (++Counts.Memory > 64)
           rejectDirect("physical memory operation count exceeds 64");
         if (!IsInteger(Store->getValueOperand(),
@@ -676,6 +805,8 @@ DirectCounts checkDirectFunction(const Function &F, const Function &Helper,
         continue;
       }
       if (const auto *Call = dyn_cast<CallInst>(&I)) {
+        if (AllowsFixedLocal && isFixedLocalLifetime(*Call))
+          continue;
         if (IsHelper || Counts.Call || Call->getCalledFunction() != &Helper ||
             Call->getCallingConv() != CallingConv::Fast || Call->isTailCall() ||
             Call->arg_size() != 1 || !IsInteger(Call->getArgOperand(0)) ||
@@ -700,9 +831,12 @@ DirectCounts checkDirectFunction(const Function &F, const Function &Helper,
       rejectDirect("instruction is outside the S3b.5 direct-call profile");
     }
   }
-  if (AllowsCallLiveByteFrame && ReturnCount != 1)
-    rejectDirectByteFrame(
-        "each function requires exactly one signature-matching Return");
+  if ((AllowsCallLiveByteFrame || AllowsFixedLocal) && ReturnCount != 1)
+    AllowsFixedLocal
+        ? rejectDirectFixedLocal(
+              "each function requires exactly one signature-matching Return")
+        : rejectDirectByteFrame(
+              "each function requires exactly one signature-matching Return");
   if (ReturnCount == 0)
     rejectDirect("each direct-call function requires a Return");
   if ((!IsHelper && !Counts.Call) || (IsHelper && Counts.Call))
@@ -763,8 +897,14 @@ DirectCounts checkDirectFunction(const Function &F, const Function &Helper,
         const auto *Use = dyn_cast<Instruction>(U);
         if (!Use || !AfterCall.contains(Use))
           continue;
-        if (!AllowsCallLiveHome && !AllowsCallLiveByteFrame)
+        if (AllowsFixedLocal && isa<AllocaInst>(I))
+          continue;
+        if (!AllowsCallLiveHome && !AllowsCallLiveByteFrame &&
+            !AllowsFixedLocal)
           rejectDirect("caller SSA value remains live across the call");
+        if (AllowsFixedLocal)
+          rejectDirectFixedLocal(
+              "non-local SSA value remains live across the direct call");
         const auto *Load = dyn_cast<LoadInst>(I);
         if (!Load || !Load->getType()->isIntegerTy(32))
           AllowsCallLiveByteFrame
@@ -795,6 +935,123 @@ DirectCounts checkDirectFunction(const Function &F, const Function &Helper,
   return Counts;
 }
 
+bool checkFixedLocalShape(const Module &M) {
+  const Function *Entry = M.getFunction("brace_system_entry");
+  const Function *Helper = M.getFunction("brace_system_call_leaf");
+  if (!Entry || !Helper)
+    rejectDirectFixedLocal("required entry or helper identity is missing");
+
+  SmallVector<const AllocaInst *, 2> Allocas;
+  SmallVector<const LoadInst *, 2> LocalLoads;
+  SmallVector<const StoreInst *, 2> LocalStores;
+  SmallVector<const CallInst *, 2> LifetimeStarts;
+  SmallVector<const CallInst *, 2> LifetimeEnds;
+  for (const BasicBlock &Block : *Entry)
+    for (const Instruction &I : Block) {
+      if (const auto *Alloca = dyn_cast<AllocaInst>(&I))
+        Allocas.push_back(Alloca);
+      if (const auto *Load = dyn_cast<LoadInst>(&I))
+        if (Load->getPointerAddressSpace() == 0)
+          LocalLoads.push_back(Load);
+      if (const auto *Store = dyn_cast<StoreInst>(&I))
+        if (Store->getPointerAddressSpace() == 0)
+          LocalStores.push_back(Store);
+      if (const auto *Call = dyn_cast<CallInst>(&I)) {
+        const Function *Callee = Call->getCalledFunction();
+        if (!Callee)
+          continue;
+        if (Callee->getIntrinsicID() == Intrinsic::lifetime_start)
+          LifetimeStarts.push_back(Call);
+        else if (Callee->getIntrinsicID() == Intrinsic::lifetime_end)
+          LifetimeEnds.push_back(Call);
+      }
+    }
+
+  if (Allocas.empty()) {
+    if (!LocalLoads.empty() || !LocalStores.empty() ||
+        !LifetimeStarts.empty() || !LifetimeEnds.empty() ||
+        std::distance(M.begin(), M.end()) != 2)
+      rejectDirectFixedLocal(
+          "FL0 requires no alloca, local access, lifetime, or declaration");
+    return false;
+  }
+
+  unsigned Definitions = 0;
+  unsigned Declarations = 0;
+  bool HasLifetimeStartDeclaration = false;
+  bool HasLifetimeEndDeclaration = false;
+  for (const Function &F : M) {
+    if (F.isDeclaration()) {
+      ++Declarations;
+      HasLifetimeStartDeclaration |=
+          F.getIntrinsicID() == Intrinsic::lifetime_start;
+      HasLifetimeEndDeclaration |=
+          F.getIntrinsicID() == Intrinsic::lifetime_end;
+      checkFixedLocalLifetimeDeclaration(F);
+    } else {
+      ++Definitions;
+    }
+  }
+  if (Definitions != 2 || Declarations != 2 || !HasLifetimeStartDeclaration ||
+      !HasLifetimeEndDeclaration || Allocas.size() != 1 ||
+      LocalLoads.size() != 1 || LocalStores.size() != 1 ||
+      LifetimeStarts.size() != 1 || LifetimeEnds.size() != 1 ||
+      Entry->getInstructionCount() != 10 || Helper->getInstructionCount() != 3)
+    rejectDirectFixedLocal(
+        "FL1 exact function, instruction, alloca, lifetime, or local-access "
+        "count mismatch");
+
+  const AllocaInst *Local = Allocas.front();
+  const LoadInst *LocalLoad = LocalLoads.front();
+  const StoreInst *LocalStore = LocalStores.front();
+  const CallInst *LifetimeStart = LifetimeStarts.front();
+  const CallInst *LifetimeEnd = LifetimeEnds.front();
+  if (Local->isUsedWithInAlloca() || Local->isSwiftError())
+    rejectDirectFixedLocal(
+        "FL1 alloca cannot carry inalloca or swifterror semantics");
+  checkFixedLocalMemory(*LocalLoad);
+  checkFixedLocalMemory(*LocalStore);
+  checkFixedLocalLifetimeCall(*LifetimeStart, Local);
+  checkFixedLocalLifetimeCall(*LifetimeEnd, Local);
+  if (Local->getNumUses() != 4 || LocalLoad->getPointerOperand() != Local ||
+      LocalStore->getPointerOperand() != Local ||
+      LifetimeStart->arg_size() != 1 ||
+      LifetimeStart->getArgOperand(0) != Local ||
+      LifetimeEnd->arg_size() != 1 || LifetimeEnd->getArgOperand(0) != Local)
+    rejectDirectFixedLocal(
+        "FL1 local pointer use-set is not exact load/store/lifetime start/end");
+
+  SmallVector<const Instruction *, 10> Sequence;
+  for (const BasicBlock &Block : *Entry)
+    for (const Instruction &I : Block)
+      Sequence.push_back(&I);
+  if (Entry->size() != 1 || Sequence.size() != 10 || Sequence[0] != Local ||
+      !isa<LoadInst>(Sequence[1]) || Sequence[2] != LifetimeStart ||
+      Sequence[3] != LocalStore || Sequence[5] != LocalLoad ||
+      !isa<BinaryOperator>(Sequence[6]) || !isa<StoreInst>(Sequence[7]) ||
+      Sequence[8] != LifetimeEnd || !isa<ReturnInst>(Sequence[9]))
+    rejectDirectFixedLocal("FL1 entry instruction order is not exact");
+
+  const auto *PhysicalLoad = cast<LoadInst>(Sequence[1]);
+  const auto *DirectCall = dyn_cast<CallInst>(Sequence[4]);
+  const auto *And = cast<BinaryOperator>(Sequence[6]);
+  const auto *PhysicalStore = cast<StoreInst>(Sequence[7]);
+  if (PhysicalLoad->getPointerAddressSpace() != 200 ||
+      !PhysicalLoad->getType()->isIntegerTy(32) || !DirectCall ||
+      DirectCall->getCalledFunction() != Helper ||
+      DirectCall->arg_size() != 1 ||
+      DirectCall->getArgOperand(0) != PhysicalLoad ||
+      LocalStore->getValueOperand() != PhysicalLoad ||
+      And->getOpcode() != Instruction::And || And->getOperand(0) != LocalLoad ||
+      And->getOperand(1) != DirectCall ||
+      PhysicalStore->getPointerAddressSpace() != 200 ||
+      PhysicalStore->getValueOperand() != And ||
+      cast<ReturnInst>(Sequence[9])->getReturnValue())
+    rejectDirectFixedLocal(
+        "FL1 physical/local/call/result dataflow is not exact");
+  return true;
+}
+
 bool checkDirectCallModule(const Module &M, StringRef RequiredABI) {
   const Function *Entry = M.getFunction("brace_system_entry");
   const Function *Helper = M.getFunction("brace_system_call_leaf");
@@ -806,14 +1063,19 @@ bool checkDirectCallModule(const Module &M, StringRef RequiredABI) {
         Call->getFunction() != Entry)
       rejectDirect("helper address escapes the single direct call");
   }
-  const bool HelperPhysical = hasDirectPhysicalMemory(*Helper);
   const bool DirectCallHome = RequiredABI == BraceSdagDirectCallHomeABIName;
   const bool DirectCallByteFrame =
       RequiredABI == BraceSdagDirectCallByteFrameABIName;
-  const DirectCounts EntryCounts =
-      checkDirectFunction(*Entry, *Helper, false,
-                          hasDirectPhysicalMemory(*Entry) || HelperPhysical,
-                          DirectCallHome, DirectCallByteFrame);
+  const bool DirectCallFixedLocal = isFixedLocalABIName(RequiredABI);
+  const bool HelperPhysical = DirectCallFixedLocal
+                                  ? hasFixedLocalPhysicalMemory(*Helper)
+                                  : hasDirectPhysicalMemory(*Helper);
+  const bool EntryPhysical = DirectCallFixedLocal
+                                 ? hasFixedLocalPhysicalMemory(*Entry)
+                                 : hasDirectPhysicalMemory(*Entry);
+  const DirectCounts EntryCounts = checkDirectFunction(
+      *Entry, *Helper, false, EntryPhysical || HelperPhysical, DirectCallHome,
+      DirectCallByteFrame, DirectCallFixedLocal);
   const DirectCounts HelperCounts =
       checkDirectFunction(*Helper, *Helper, true, HelperPhysical,
                           /*AllowsCallLiveHome=*/false, DirectCallByteFrame);
@@ -822,11 +1084,14 @@ bool checkDirectCallModule(const Module &M, StringRef RequiredABI) {
       EntryCounts.Values + HelperCounts.Values > 128 ||
       EntryCounts.Memory + HelperCounts.Memory > 64)
     rejectDirect("module resource limit exceeded");
+  if (DirectCallFixedLocal)
+    return checkFixedLocalShape(M);
   return EntryCounts.CallLiveValues == 1;
 }
 
 void checkModuleEnvelope(const Module &M, StringRef RequiredABI) {
   const bool DirectCall = isDirectCallABIName(RequiredABI);
+  const bool FixedLocal = isFixedLocalABIName(RequiredABI);
   if (M.getTargetTriple().str() != RequiredTriple ||
       M.getDataLayoutStr() != RequiredDataLayout) {
     if (DirectCall)
@@ -845,9 +1110,13 @@ void checkModuleEnvelope(const Module &M, StringRef RequiredABI) {
       rejectDirect("identified types and COMDAT are not admitted");
     reject("identified types and COMDAT are not admitted");
   }
-  if (std::distance(M.begin(), M.end()) != (DirectCall ? 2 : 1)) {
+  const auto FunctionCount = std::distance(M.begin(), M.end());
+  if ((FixedLocal && FunctionCount != 2 && FunctionCount != 4) ||
+      (!FixedLocal && FunctionCount != (DirectCall ? 2 : 1))) {
     if (DirectCall)
-      rejectDirect("exactly two functions are required");
+      FixedLocal ? rejectDirectFixedLocal(
+                       "FL0 requires two functions and FL1 exactly four")
+                 : rejectDirect("exactly two functions are required");
     reject("exactly one function is required");
   }
 
@@ -875,7 +1144,8 @@ public:
   explicit BraceS3IRVerifier(StringRef RequiredABI)
       : ModulePass(ID), RequiredABI(RequiredABI),
         VerifyDuringInitialization(
-            RequiredABI == BraceSdagDirectCallByteFrameABIName) {}
+            RequiredABI == BraceSdagDirectCallByteFrameABIName ||
+            RequiredABI == BraceSdagDirectCallByteFrameFixedLocalABIName) {}
 
   bool doInitialization(Module &M) override {
     // A legacy FunctionPassManager initializes AsmPrinter before running the
@@ -915,6 +1185,12 @@ bool llvm::verifyBraceS3ByteFrameIRAndRequiresRootFrame(const Module &M) {
   return checkDirectCallModule(M, BraceSdagDirectCallByteFrameABIName);
 }
 
+bool llvm::verifyBraceS3FixedLocalIRAndRequiresRootFrame(const Module &M) {
+  checkModuleEnvelope(M, BraceSdagDirectCallByteFrameFixedLocalABIName);
+  return checkDirectCallModule(M,
+                               BraceSdagDirectCallByteFrameFixedLocalABIName);
+}
+
 void llvm::verifyBraceS3LateModuleEnvelope(const Module &M,
                                            StringRef RequiredABI) {
   checkModuleEnvelope(M, RequiredABI);
@@ -923,9 +1199,14 @@ void llvm::verifyBraceS3LateModuleEnvelope(const Module &M,
     const Function *Helper = M.getFunction("brace_system_call_leaf");
     if (!Entry || !Helper)
       rejectDirect("required entry or helper identity is missing");
-    const bool HelperPhysical = hasDirectPhysicalMemory(*Helper);
-    checkDirectFunctionHeader(
-        *Entry, false, hasDirectPhysicalMemory(*Entry) || HelperPhysical);
+    const bool FixedLocal = isFixedLocalABIName(RequiredABI);
+    const bool HelperPhysical = FixedLocal
+                                    ? hasFixedLocalPhysicalMemory(*Helper)
+                                    : hasDirectPhysicalMemory(*Helper);
+    checkDirectFunctionHeader(*Entry, false,
+                              (FixedLocal ? hasFixedLocalPhysicalMemory(*Entry)
+                                          : hasDirectPhysicalMemory(*Entry)) ||
+                                  HelperPhysical);
     checkDirectFunctionHeader(*Helper, true, HelperPhysical);
     return;
   }

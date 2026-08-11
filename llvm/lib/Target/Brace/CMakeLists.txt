@@ -11,6 +11,7 @@ add_llvm_target(BraceCodeGen
   BraceAsmPrinter.cpp
   BraceFinalizeBranches.cpp
   BraceFinalizeByteFrame.cpp
+  BraceFinalizeFixedLocal.cpp
   BraceFinalizeSpillHomes.cpp
   BraceFrameLowering.cpp
   BraceInstrInfo.cpp

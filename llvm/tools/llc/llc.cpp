@@ -618,6 +618,112 @@ static int compileModule(char **argv, SmallVectorImpl<PassPlugin> &PluginList,
 
       InitializeOptions(TheTriple);
       const StringRef BraceABI = Options.MCOptions.getABIName();
+      const bool BraceDirectCallByteFrameFixedLocalABI =
+          BraceABI == "brace-system-s2-direct-call-byte-frame-fixed-local-r0";
+      const Triple OriginalTriple(Triple::normalize(DataLayoutTargetTriple));
+      const bool OriginalOrEffectiveBrace =
+          OriginalTriple.getArch() == Triple::brace64 ||
+          TheTriple.getArch() == Triple::brace64;
+      if (BraceDirectCallByteFrameFixedLocalABI && OriginalOrEffectiveBrace) {
+        if (RunPass.getNumOccurrences() != 0 ||
+            PassPipeline.getNumOccurrences() != 0 ||
+            EnableNewPassManager.getNumOccurrences() != 0) {
+          if (!RejectedBraceS3InputEnvelope)
+            WithColor::error(errs(), argv[0])
+                << "brace64 S3b.8 fixed-local selector: explicit "
+                   "-run-pass, -passes, or -enable-new-pm is outside the "
+                   "registered pipeline\n";
+          RejectedBraceS3InputEnvelope = true;
+        }
+        auto &PassLimitOptions = cl::getRegisteredOptions();
+        struct PassLimitOptionState {
+          StringRef Value;
+          int Occurrences;
+        };
+        auto ReadPassLimit =
+            [&](StringRef Name) -> std::optional<PassLimitOptionState> {
+          const auto Found = PassLimitOptions.find(Name);
+          if (Found == PassLimitOptions.end())
+            return std::nullopt;
+          const auto *Option =
+              static_cast<cl::opt<std::string> *>(Found->second);
+          return PassLimitOptionState{Option->getValue(),
+                                      Option->getNumOccurrences()};
+        };
+        const std::optional<PassLimitOptionState> StartBefore =
+            ReadPassLimit("start-before");
+        const std::optional<PassLimitOptionState> StartAfter =
+            ReadPassLimit("start-after");
+        const std::optional<PassLimitOptionState> StopBefore =
+            ReadPassLimit("stop-before");
+        const std::optional<PassLimitOptionState> StopAfter =
+            ReadPassLimit("stop-after");
+        if (!StartBefore || !StartAfter || !StopBefore || !StopAfter) {
+          if (!RejectedBraceS3InputEnvelope)
+            WithColor::error(errs(), argv[0])
+                << "brace64 S3b.8 fixed-local selector: missing pass-limit "
+                   "option\n";
+          RejectedBraceS3InputEnvelope = true;
+        } else {
+          auto IsRestartSeam = [](StringRef Name) {
+            return Name == "finalize-isel" || Name == "virtregrewriter" ||
+                   Name == "stack-slot-coloring" ||
+                   Name == "brace-finalize-fixed-local-byte-frame" ||
+                   Name == "brace-finalize-branches";
+          };
+          auto IsStop = [&](StringRef Name) {
+            return IsRestartSeam(Name) ||
+                   Name == "brace-verify-final-fixed-local-publication";
+          };
+          auto IsForwardPair = [](StringRef Start, StringRef Stop) {
+            return (Start == "finalize-isel" && Stop == "virtregrewriter") ||
+                   (Start == "virtregrewriter" &&
+                    Stop == "stack-slot-coloring") ||
+                   (Start == "stack-slot-coloring" &&
+                    Stop == "brace-finalize-fixed-local-byte-frame") ||
+                   (Start == "brace-finalize-fixed-local-byte-frame" &&
+                    Stop == "brace-finalize-branches");
+          };
+          const bool StartAfterExact =
+              StartAfter->Occurrences == 0 ||
+              (StartAfter->Occurrences == 1 && !StartAfter->Value.empty() &&
+               IsRestartSeam(StartAfter->Value));
+          const bool StopAfterExact =
+              StopAfter->Occurrences == 0 ||
+              (StopAfter->Occurrences == 1 && !StopAfter->Value.empty() &&
+               IsStop(StopAfter->Value));
+          const bool PairExact =
+              StartAfter->Occurrences == 0 || StopAfter->Occurrences == 0 ||
+              IsForwardPair(StartAfter->Value, StopAfter->Value);
+          const bool PassLimitSyntaxAdmitted =
+              StartBefore->Occurrences == 0 && StopBefore->Occurrences == 0 &&
+              StartAfterExact && StopAfterExact && PairExact;
+          if (PassLimitSyntaxAdmitted && StartAfter->Occurrences != 0 && !MIR) {
+            if (!RejectedBraceS3InputEnvelope)
+              WithColor::error(errs(), argv[0])
+                  << "brace64 S3b.8 fixed-local selector: explicit "
+                     "-start-after requires MIR input\n";
+            RejectedBraceS3InputEnvelope = true;
+          } else if (PassLimitSyntaxAdmitted && StartAfter->Occurrences == 0 &&
+                     MIR) {
+            if (!RejectedBraceS3InputEnvelope)
+              WithColor::error(errs(), argv[0])
+                  << "brace64 S3b.8 fixed-local selector: MIR input requires "
+                     "one explicit registered -start-after\n";
+            RejectedBraceS3InputEnvelope = true;
+          }
+        }
+      }
+      if (BraceDirectCallByteFrameFixedLocalABI && OriginalOrEffectiveBrace &&
+          (OriginalTriple.getTriple() != "brace64-unknown-none-elf" ||
+           OldDLStr != "e-m:e-p:64:64-i64:64-i128:128-n32:64-S128" ||
+           TheTriple.getTriple() != "brace64-unknown-none-elf")) {
+        if (!RejectedBraceS3InputEnvelope)
+          WithColor::error(errs(), argv[0])
+              << "brace64 S3b.8 fixed-local input/effective triple or data "
+                 "layout mismatch\n";
+        RejectedBraceS3InputEnvelope = true;
+      }
       const bool BraceDirectCallABI =
           BraceABI == "brace-system-s2-direct-call-r0";
       const bool BraceDirectCallHomeABI =

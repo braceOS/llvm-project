@@ -65,6 +65,29 @@
 // RUN:   -S -emit-llvm -o - %s | FileCheck -check-prefix=IR %s
 // RUN: not %clang --target=brace-unknown-none-elf -fsyntax-only %s \
 // RUN:   2>&1 | FileCheck -check-prefix=NO-ALIAS %s
+// RUN: %clang -### --target=brace64-unknown-none-elf -ffreestanding \
+// RUN:   -nostdinc -c -emit-llvm \
+// RUN:   -mabi=brace-system-s2-direct-call-byte-frame-fixed-local-r0 %s \
+// RUN:   2>&1 | FileCheck -check-prefix=CALL-BYTE-FRAME-FIXED-LOCAL-ABI %s
+// RUN: not %clang -### --target=brace64-unknown-none-elf -ffreestanding \
+// RUN:   -nostdinc -c -emit-llvm \
+// RUN:   -mabi=brace-system-s2-direct-call-byte-frame-fixed-local-r0 \
+// RUN:   -mabi=brace-system-s2-direct-call-byte-frame-fixed-local-r0 %s \
+// RUN:   2>&1 | FileCheck -check-prefix=FIXED-LOCAL-DUPLICATE %s
+// RUN: not %clang -### --target=brace64-unknown-none-elf -ffreestanding \
+// RUN:   -nostdinc -c -emit-llvm \
+// RUN:   -mabi=brace-system-s2-direct-call-byte-frame-fixed-local-r0 \
+// RUN:   -mabi=brace-system-s2-direct-call-byte-frame-r0 %s 2>&1 | \
+// RUN:   FileCheck -check-prefix=BYTE-FRAME-DUPLICATE %s
+// RUN: not %clang -### --target=brace64-unknown-none-elf -ffreestanding \
+// RUN:   -nostdinc -c -emit-llvm \
+// RUN:   -mabi=brace-system-s2-direct-call-byte-frame-r0 \
+// RUN:   -mabi=brace-system-s2-direct-call-byte-frame-fixed-local-r0 %s \
+// RUN:   2>&1 | FileCheck -check-prefix=BYTE-FRAME-DUPLICATE %s
+// RUN: not %clang -### --target=brace64-unknown-none-elf -ffreestanding \
+// RUN:   -nostdinc -c -Xclang -target-abi \
+// RUN:   -Xclang brace-system-s2-direct-call-byte-frame-fixed-local-r0 %s \
+// RUN:   2>&1 | FileCheck -check-prefix=XCLANG-ABI %s
 
 // DEFAULT-ABI: "-cc1"
 // DEFAULT-ABI-SAME: "-triple" "brace64-unknown-none-elf"
@@ -102,5 +125,11 @@
 // IR: define{{.*}} i64 @brace_identity(i64
 
 // NO-ALIAS: error: unknown target triple 'brace-unknown-none-elf'
+
+// CALL-BYTE-FRAME-FIXED-LOCAL-ABI: "-cc1"
+// CALL-BYTE-FRAME-FIXED-LOCAL-ABI-SAME: "-triple" "brace64-unknown-none-elf"
+// CALL-BYTE-FRAME-FIXED-LOCAL-ABI-SAME: "-target-abi" "brace-system-s2-direct-call-byte-frame-fixed-local-r0"
+
+// FIXED-LOCAL-DUPLICATE: error: unsupported option '-mabi=brace-system-s2-direct-call-byte-frame-fixed-local-r0' for target 'brace64-unknown-none-elf'
 
 unsigned long brace_identity(unsigned long Value) { return Value + 1; }

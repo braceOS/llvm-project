@@ -17,8 +17,12 @@ using namespace llvm;
 namespace {
 
 class BraceDAGToDAGISel final : public SelectionDAGISel {
+  bool FixedLocal = false;
+
 public:
-  explicit BraceDAGToDAGISel(BraceTargetMachine &TM) : SelectionDAGISel(TM) {}
+  explicit BraceDAGToDAGISel(BraceTargetMachine &TM)
+      : SelectionDAGISel(TM),
+        FixedLocal(TM.usesSdagDirectCallByteFrameFixedLocalABI()) {}
 
   void Select(SDNode *Node) override;
 
@@ -44,6 +48,13 @@ static void requirePhysicalMemory(const MemSDNode &Node) {
     report_fatal_error(
         "brace64 S3b.3 leaf ABI requires volatile unindexed addrspace(200) "
         "memory");
+}
+
+static void requireFixedLocalMemory(const MemSDNode &Node) {
+  if (Node.getAddressSpace() != 0 || !Node.isVolatile() || Node.isAtomic())
+    report_fatal_error(
+        "brace64 S3b.8 fixed-local ABI requires volatile unindexed AS0 "
+        "local memory");
 }
 
 void BraceDAGToDAGISel::Select(SDNode *Node) {
@@ -85,6 +96,25 @@ void BraceDAGToDAGISel::Select(SDNode *Node) {
   }
   case ISD::LOAD: {
     auto *Load = cast<LoadSDNode>(Node);
+    if (FixedLocal && Load->getAddressSpace() == 0) {
+      requireFixedLocalMemory(*Load);
+      const EVT VT = Load->getMemoryVT();
+      if (VT != MVT::i32 || VT != Load->getValueType(0) ||
+          Load->getAddressingMode() != ISD::UNINDEXED ||
+          !isa<FrameIndexSDNode>(Load->getBasePtr()))
+        report_fatal_error(
+            "brace64 S3b.8 fixed-local ABI only admits one exact i32 local "
+            "load from a FrameIndex");
+      const auto *FI = cast<FrameIndexSDNode>(Load->getBasePtr());
+      SDValue TargetFI = CurDAG->getTargetFrameIndex(
+          FI->getIndex(), Load->getBasePtr().getValueType());
+      SDNode *Selected =
+          CurDAG->SelectNodeTo(Node, Brace::LOCAL_LOAD32, VT, MVT::Other,
+                               TargetFI, Load->getChain());
+      CurDAG->setNodeMemRefs(cast<MachineSDNode>(Selected),
+                             {Load->getMemOperand()});
+      return;
+    }
     requirePhysicalMemory(*Load);
     EVT VT = Load->getMemoryVT();
     if (VT != Load->getValueType(0) || (VT != MVT::i8 && VT != MVT::i32))
@@ -99,6 +129,25 @@ void BraceDAGToDAGISel::Select(SDNode *Node) {
   }
   case ISD::STORE: {
     auto *Store = cast<StoreSDNode>(Node);
+    if (FixedLocal && Store->getAddressSpace() == 0) {
+      requireFixedLocalMemory(*Store);
+      const EVT VT = Store->getMemoryVT();
+      if (VT != MVT::i32 || VT != Store->getValue().getValueType() ||
+          Store->getAddressingMode() != ISD::UNINDEXED ||
+          !isa<FrameIndexSDNode>(Store->getBasePtr()))
+        report_fatal_error(
+            "brace64 S3b.8 fixed-local ABI only admits one exact i32 local "
+            "store to a FrameIndex");
+      const auto *FI = cast<FrameIndexSDNode>(Store->getBasePtr());
+      SDValue TargetFI = CurDAG->getTargetFrameIndex(
+          FI->getIndex(), Store->getBasePtr().getValueType());
+      SDNode *Selected =
+          CurDAG->SelectNodeTo(Node, Brace::LOCAL_STORE32, MVT::Other,
+                               Store->getValue(), TargetFI, Store->getChain());
+      CurDAG->setNodeMemRefs(cast<MachineSDNode>(Selected),
+                             {Store->getMemOperand()});
+      return;
+    }
     requirePhysicalMemory(*Store);
     EVT VT = Store->getMemoryVT();
     if (VT != Store->getValue().getValueType() ||

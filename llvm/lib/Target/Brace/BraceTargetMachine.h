@@ -25,7 +25,8 @@ public:
     LeafHome,
     DirectCall,
     DirectCallHome,
-    DirectCallByteFrame
+    DirectCallByteFrame,
+    DirectCallByteFrameFixedLocal
   };
 
 private:
@@ -77,12 +78,16 @@ public:
   bool usesSdagDirectCallByteFrameABI() const {
     return SdagABI == SdagABIKind::DirectCallByteFrame;
   }
+  bool usesSdagDirectCallByteFrameFixedLocalABI() const {
+    return SdagABI == SdagABIKind::DirectCallByteFrameFixedLocal;
+  }
   bool usesSdagSpillHomes() const {
     return usesSdagLeafHomeABI() || usesSdagDirectCallHomeABI();
   }
   bool usesSdagDirectCalls() const {
     return usesSdagDirectCallABI() || usesSdagDirectCallHomeABI() ||
-           usesSdagDirectCallByteFrameABI();
+           usesSdagDirectCallByteFrameABI() ||
+           usesSdagDirectCallByteFrameFixedLocalABI();
   }
   StringRef getSdagABIName() const;
   bool isMachineVerifierClean() const override { return true; }

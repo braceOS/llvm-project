@@ -2028,15 +2028,25 @@ void Clang::AddBraceTargetArgs(const ArgList &Args,
 
   unsigned ABIArgumentCount = 0;
   const Arg *ByteFrameArgument = nullptr;
+  const Arg *FixedLocalArgument = nullptr;
   for (const Arg *ABIArgument : Args.filtered(options::OPT_mabi_EQ)) {
     ++ABIArgumentCount;
     if (StringRef(ABIArgument->getValue()) ==
         "brace-system-s2-direct-call-byte-frame-r0")
       ByteFrameArgument = ABIArgument;
+    if (StringRef(ABIArgument->getValue()) ==
+        "brace-system-s2-direct-call-byte-frame-fixed-local-r0")
+      FixedLocalArgument = ABIArgument;
   }
   if (ByteFrameArgument && ABIArgumentCount != 1) {
     getToolChain().getDriver().Diag(diag::err_drv_unsupported_opt_for_target)
         << ByteFrameArgument->getAsString(Args)
+        << getToolChain().getTriple().str();
+    return;
+  }
+  if (FixedLocalArgument && ABIArgumentCount != 1) {
+    getToolChain().getDriver().Diag(diag::err_drv_unsupported_opt_for_target)
+        << FixedLocalArgument->getAsString(Args)
         << getToolChain().getTriple().str();
     return;
   }
@@ -2046,7 +2056,8 @@ void Clang::AddBraceTargetArgs(const ArgList &Args,
       ABIName != "brace-system-s2-leaf-home-r0" &&
       ABIName != "brace-system-s2-direct-call-r0" &&
       ABIName != "brace-system-s2-direct-call-home-r0" &&
-      ABIName != "brace-system-s2-direct-call-byte-frame-r0") {
+      ABIName != "brace-system-s2-direct-call-byte-frame-r0" &&
+      ABIName != "brace-system-s2-direct-call-byte-frame-fixed-local-r0") {
     getToolChain().getDriver().Diag(diag::err_drv_unsupported_option_argument)
         << A->getSpelling() << ABIName;
     return;
@@ -2054,7 +2065,8 @@ void Clang::AddBraceTargetArgs(const ArgList &Args,
 
   if (ABIName == "brace-system-s2-direct-call-r0" ||
       ABIName == "brace-system-s2-direct-call-home-r0" ||
-      ABIName == "brace-system-s2-direct-call-byte-frame-r0") {
+      ABIName == "brace-system-s2-direct-call-byte-frame-r0" ||
+      ABIName == "brace-system-s2-direct-call-byte-frame-fixed-local-r0") {
     const Arg *Unsupported =
         Args.getLastArg(options::OPT_flto, options::OPT_flto_EQ);
     if (!Unsupported)
