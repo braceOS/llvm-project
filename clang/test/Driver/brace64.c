@@ -2,6 +2,57 @@
 // RUN:   -nostdinc -c -emit-llvm %s 2>&1 | \
 // RUN:   FileCheck -check-prefix=DEFAULT-ABI %s
 // RUN: %clang -### --target=brace64-unknown-none-elf -ffreestanding \
+// RUN:   -nostdinc -c -emit-llvm \
+// RUN:   -mabi=brace-system-llvm-reference-as1-r0 %s 2>&1 | \
+// RUN:   FileCheck -check-prefix=REFERENCE-AS1-ABI %s
+// RUN: %clang -### --target=brace64-unknown-none-elf -ffreestanding \
+// RUN:   -nostdinc -E -dM -mabi=brace-system-llvm-reference-as1-r0 %s \
+// RUN:   2>&1 | FileCheck -check-prefix=REFERENCE-AS1-ABI %s
+// RUN: %clang -### --target=brace64-unknown-none-elf -ffreestanding \
+// RUN:   -nostdinc -M -mabi=brace-system-llvm-reference-as1-r0 %s 2>&1 | \
+// RUN:   FileCheck -check-prefix=REFERENCE-AS1-ABI %s
+// RUN: %clang -### --target=brace64-unknown-none-elf -ffreestanding \
+// RUN:   -nostdinc -MM -mabi=brace-system-llvm-reference-as1-r0 %s 2>&1 | \
+// RUN:   FileCheck -check-prefix=REFERENCE-AS1-ABI %s
+// RUN: %clang -### --target=brace64-unknown-none-elf -ffreestanding \
+// RUN:   -nostdinc -fsyntax-only \
+// RUN:   -mabi=brace-system-llvm-reference-as1-r0 %s 2>&1 | \
+// RUN:   FileCheck -check-prefix=REFERENCE-AS1-ABI %s
+// RUN: not %clang -### --target=brace64-unknown-none-elf -ffreestanding \
+// RUN:   -nostdinc -S -mabi=brace-system-llvm-reference-as1-r0 %s 2>&1 | \
+// RUN:   FileCheck -check-prefix=REFERENCE-AS1-NATIVE %s
+// RUN: not %clang -### --target=brace64-unknown-none-elf -ffreestanding \
+// RUN:   -nostdinc -c -mabi=brace-system-llvm-reference-as1-r0 %s 2>&1 | \
+// RUN:   FileCheck -check-prefix=REFERENCE-AS1-NATIVE %s
+// RUN: not %clang -### --target=brace64-unknown-none-elf -ffreestanding \
+// RUN:   -nostdinc -c -emit-llvm \
+// RUN:   -mabi=brace-system-llvm-reference-as1-r0 \
+// RUN:   -mabi=brace-system-llvm-reference-as1-r0 %s 2>&1 | \
+// RUN:   FileCheck -check-prefix=REFERENCE-AS1-DUPLICATE %s
+// RUN: not %clang -### --target=brace64-unknown-none-elf -ffreestanding \
+// RUN:   -nostdinc -c -emit-llvm -mabi=brace-system-llvm-reference-as1-r0 \
+// RUN:   -mabi=brace-system-s2-leaf-r0 %s 2>&1 | \
+// RUN:   FileCheck -check-prefix=REFERENCE-AS1-DUPLICATE %s
+// RUN: not %clang -### --target=brace64-unknown-none-elf -ffreestanding \
+// RUN:   -nostdinc -c -emit-llvm -mabi=brace-system-s2-leaf-r0 \
+// RUN:   -mabi=brace-system-llvm-reference-as1-r0 %s 2>&1 | \
+// RUN:   FileCheck -check-prefix=REFERENCE-AS1-DUPLICATE %s
+// RUN: not %clang -### --target=brace64-unknown-none-elf -ffreestanding \
+// RUN:   -nostdinc -c -emit-llvm -mabi=brace-system-llvm-reference-as1-r0 \
+// RUN:   -flto %s 2>&1 | FileCheck -check-prefix=REFERENCE-AS1-LTO %s
+// RUN: not %clang -### --target=brace64-unknown-none-elf -ffreestanding \
+// RUN:   -nostdinc -c -emit-llvm -mabi=brace-system-llvm-reference-as1-r0 \
+// RUN:   -mllvm -verify-machineinstrs %s 2>&1 | \
+// RUN:   FileCheck -check-prefix=REFERENCE-AS1-MLLVM %s
+// RUN: not %clang -### --target=brace64-unknown-none-elf -ffreestanding \
+// RUN:   -nostdinc -c -emit-llvm -mabi=brace-system-llvm-reference-as1-r0 \
+// RUN:   -fexceptions %s 2>&1 | \
+// RUN:   FileCheck -check-prefix=REFERENCE-AS1-EXCEPTIONS %s
+// RUN: not %clang -### --target=brace64-unknown-none-elf -ffreestanding \
+// RUN:   -nostdinc -c -emit-llvm -mabi=brace-system-llvm-reference-as1-r0 \
+// RUN:   -Xclang -disable-llvm-passes %s 2>&1 | \
+// RUN:   FileCheck -check-prefix=REFERENCE-AS1-XCLANG %s
+// RUN: %clang -### --target=brace64-unknown-none-elf -ffreestanding \
 // RUN:   -nostdinc -c -emit-llvm -mabi=brace-system-s2-leaf-r0 %s 2>&1 | \
 // RUN:   FileCheck -check-prefix=LEAF-ABI %s
 // RUN: %clang -### --target=brace64-unknown-none-elf -ffreestanding \
@@ -93,6 +144,17 @@
 // DEFAULT-ABI-SAME: "-triple" "brace64-unknown-none-elf"
 // DEFAULT-ABI-SAME: "-emit-llvm-bc"
 // DEFAULT-ABI-NOT: "-target-abi"
+
+// REFERENCE-AS1-ABI: "-cc1"
+// REFERENCE-AS1-ABI-SAME: "-triple" "brace64-unknown-none-elf"
+// REFERENCE-AS1-ABI-SAME: "-target-abi" "brace-system-llvm-reference-as1-r0"
+
+// REFERENCE-AS1-NATIVE: error: unsupported option '-mabi=brace-system-llvm-reference-as1-r0' for target 'brace64-unknown-none-elf'
+// REFERENCE-AS1-DUPLICATE: error: unsupported option '-mabi=brace-system-llvm-reference-as1-r0' for target 'brace64-unknown-none-elf'
+// REFERENCE-AS1-LTO: error: unsupported option '-flto' for target 'brace64-unknown-none-elf'
+// REFERENCE-AS1-MLLVM: error: unsupported option '-mllvm -verify-machineinstrs' for target 'brace64-unknown-none-elf'
+// REFERENCE-AS1-EXCEPTIONS: error: unsupported option '-fexceptions' for target 'brace64-unknown-none-elf'
+// REFERENCE-AS1-XCLANG: error: unsupported option '-Xclang -disable-llvm-passes' for target 'brace64-unknown-none-elf'
 
 // LEAF-ABI: "-cc1"
 // LEAF-ABI-SAME: "-triple" "brace64-unknown-none-elf"

@@ -126,6 +126,8 @@ inline constexpr StringLiteral BraceSdagDirectCallByteFrameABIName =
     "brace-system-s2-direct-call-byte-frame-r0";
 inline constexpr StringLiteral BraceSdagDirectCallByteFrameFixedLocalABIName =
     "brace-system-s2-direct-call-byte-frame-fixed-local-r0";
+inline constexpr StringLiteral BraceLLVMReferenceAS1ABIName =
+    "brace-system-llvm-reference-as1-r0";
 inline constexpr StringLiteral BraceSdagLeafHomeCompilerIdentity =
     "brace.exp.llvm22.brace64.system.r32-physical.sdag-leaf-spill-home@0";
 inline constexpr StringLiteral BraceSdagLeafHomeCodegenProfile =

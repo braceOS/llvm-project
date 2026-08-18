@@ -558,6 +558,8 @@ std::string Triple::computeDataLayout(StringRef ABIName) const {
   case Triple::bpfeb:
     return computeBPFDataLayout(*this);
   case Triple::brace64:
+    if (ABIName == "brace-system-llvm-reference-as1-r0")
+      return "e-m:e-p:64:64-p1:64:64-P1-i64:64-i128:128-n32:64-S128";
     return "e-m:e-p:64:64-i64:64-i128:128-n32:64-S128";
   case Triple::csky:
     return computeCSKYDataLayout(*this);

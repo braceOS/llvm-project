@@ -2562,10 +2562,13 @@ Value *ScalarExprEmitter::VisitCastExpr(CastExpr *CE) {
       return CGF.CGM.getTargetCodeGenInfo().performAddrSpaceCast(
           CGF, Src, E->getType().getAddressSpace(), DstTy);
 
-    assert(
-        (!SrcTy->isPtrOrPtrVectorTy() || !DstTy->isPtrOrPtrVectorTy() ||
-         SrcTy->getPointerAddressSpace() == DstTy->getPointerAddressSpace()) &&
-        "Address-space cast must be used to convert address spaces");
+    // A target's program address space can distinguish function pointers from
+    // object pointers even when the source language does not.  Sema may still
+    // classify an accepted source-level conversion as CK_BitCast, so select
+    // the LLVM cast from the converted IR types.
+    const bool NeedsAddrSpaceCast =
+        SrcTy->isPtrOrPtrVectorTy() && DstTy->isPtrOrPtrVectorTy() &&
+        SrcTy->getPointerAddressSpace() != DstTy->getPointerAddressSpace();
 
     if (CGF.SanOpts.has(SanitizerKind::CFIUnrelatedCast)) {
       if (auto *PT = DestTy->getAs<PointerType>()) {
@@ -2687,7 +2690,14 @@ Value *ScalarExprEmitter::VisitCastExpr(CastExpr *CE) {
       return EmitLoadOfLValue(DestLV, CE->getExprLoc());
     }
 
-    llvm::Value *Result = Builder.CreateBitCast(Src, DstTy);
+    LangAS SrcAddr = E->getType().getAddressSpace();
+    if (E->getType()->isPointerType())
+      SrcAddr = E->getType()->getPointeeType().getAddressSpace();
+    llvm::Value *Result =
+        NeedsAddrSpaceCast
+            ? CGF.CGM.getTargetCodeGenInfo().performAddrSpaceCast(
+                  CGF, Src, SrcAddr, DstTy)
+            : Builder.CreateBitCast(Src, DstTy);
     return CGF.authPointerToPointerCast(Result, E->getType(), DestTy);
   }
   case CK_AddressSpaceConversion: {

@@ -2029,6 +2029,7 @@ void Clang::AddBraceTargetArgs(const ArgList &Args,
   unsigned ABIArgumentCount = 0;
   const Arg *ByteFrameArgument = nullptr;
   const Arg *FixedLocalArgument = nullptr;
+  const Arg *LLVMReferenceAS1Argument = nullptr;
   for (const Arg *ABIArgument : Args.filtered(options::OPT_mabi_EQ)) {
     ++ABIArgumentCount;
     if (StringRef(ABIArgument->getValue()) ==
@@ -2037,6 +2038,9 @@ void Clang::AddBraceTargetArgs(const ArgList &Args,
     if (StringRef(ABIArgument->getValue()) ==
         "brace-system-s2-direct-call-byte-frame-fixed-local-r0")
       FixedLocalArgument = ABIArgument;
+    if (StringRef(ABIArgument->getValue()) ==
+        "brace-system-llvm-reference-as1-r0")
+      LLVMReferenceAS1Argument = ABIArgument;
   }
   if (ByteFrameArgument && ABIArgumentCount != 1) {
     getToolChain().getDriver().Diag(diag::err_drv_unsupported_opt_for_target)
@@ -2050,6 +2054,12 @@ void Clang::AddBraceTargetArgs(const ArgList &Args,
         << getToolChain().getTriple().str();
     return;
   }
+  if (LLVMReferenceAS1Argument && ABIArgumentCount != 1) {
+    getToolChain().getDriver().Diag(diag::err_drv_unsupported_opt_for_target)
+        << LLVMReferenceAS1Argument->getAsString(Args)
+        << getToolChain().getTriple().str();
+    return;
+  }
 
   StringRef ABIName = A->getValue();
   if (ABIName != "brace-system-s2-leaf-r0" &&
@@ -2057,16 +2067,27 @@ void Clang::AddBraceTargetArgs(const ArgList &Args,
       ABIName != "brace-system-s2-direct-call-r0" &&
       ABIName != "brace-system-s2-direct-call-home-r0" &&
       ABIName != "brace-system-s2-direct-call-byte-frame-r0" &&
-      ABIName != "brace-system-s2-direct-call-byte-frame-fixed-local-r0") {
+      ABIName != "brace-system-s2-direct-call-byte-frame-fixed-local-r0" &&
+      ABIName != "brace-system-llvm-reference-as1-r0") {
     getToolChain().getDriver().Diag(diag::err_drv_unsupported_option_argument)
         << A->getSpelling() << ABIName;
+    return;
+  }
+
+  if (ABIName == "brace-system-llvm-reference-as1-r0" &&
+      !Args.hasArg(options::OPT_emit_llvm) &&
+      !Args.hasArg(options::OPT_fsyntax_only) && !Args.hasArg(options::OPT_E) &&
+      !Args.hasArg(options::OPT_M) && !Args.hasArg(options::OPT_MM)) {
+    getToolChain().getDriver().Diag(diag::err_drv_unsupported_opt_for_target)
+        << A->getAsString(Args) << getToolChain().getTriple().str();
     return;
   }
 
   if (ABIName == "brace-system-s2-direct-call-r0" ||
       ABIName == "brace-system-s2-direct-call-home-r0" ||
       ABIName == "brace-system-s2-direct-call-byte-frame-r0" ||
-      ABIName == "brace-system-s2-direct-call-byte-frame-fixed-local-r0") {
+      ABIName == "brace-system-s2-direct-call-byte-frame-fixed-local-r0" ||
+      ABIName == "brace-system-llvm-reference-as1-r0") {
     const Arg *Unsupported =
         Args.getLastArg(options::OPT_flto, options::OPT_flto_EQ);
     if (!Unsupported)

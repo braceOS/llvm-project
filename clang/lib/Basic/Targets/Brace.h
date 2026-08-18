@@ -72,9 +72,15 @@ public:
         Name != "brace-system-s2-direct-call-r0" &&
         Name != "brace-system-s2-direct-call-home-r0" &&
         Name != "brace-system-s2-direct-call-byte-frame-r0" &&
-        Name != "brace-system-s2-direct-call-byte-frame-fixed-local-r0")
+        Name != "brace-system-s2-direct-call-byte-frame-fixed-local-r0" &&
+        Name != "brace-system-llvm-reference-as1-r0")
       return false;
     ABI = Name;
+    if (Name == "brace-system-llvm-reference-as1-r0")
+      resetDataLayout(
+          "e-m:e-p:64:64-p1:64:64-P1-i64:64-i128:128-n32:64-S128");
+    else
+      resetDataLayout("e-m:e-p:64:64-i64:64-i128:128-n32:64-S128");
     return true;
   }
 

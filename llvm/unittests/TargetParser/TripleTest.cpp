@@ -91,6 +91,10 @@ TEST(TripleTest, Brace64) {
   EXPECT_TRUE(T.isLittleEndian());
   EXPECT_EQ(Triple::ELF, T.getObjectFormat());
   EXPECT_EQ("e-m:e-p:64:64-i64:64-i128:128-n32:64-S128", T.computeDataLayout());
+  EXPECT_EQ("e-m:e-p:64:64-p1:64:64-P1-i64:64-i128:128-n32:64-S128",
+            T.computeDataLayout("brace-system-llvm-reference-as1-r0"));
+  EXPECT_EQ("e-m:e-p:64:64-i64:64-i128:128-n32:64-S128",
+            T.computeDataLayout("brace-system-s2-leaf-r0"));
   EXPECT_EQ("brace64-unknown-none-elf",
             Triple::normalize("brace64-unknown-none-elf"));
 
